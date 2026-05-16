@@ -94,10 +94,10 @@ const startSock = async() => {
 
 				if (qr && !sock.authState.creds.registered) {
 					// Ignora o QR code distorcido da nuvem e solicita o Código de Pareamento
-					const phoneNumber = '5533999958830'
+					const phoneNumber = '553399958830'
 					try {
 						const code = await sock.requestPairingCode(phoneNumber)
-						logger.info(`\n\n=======================================================\nCÓDIGO DE PAREAMENTO DO WHATSAPP: ${code}\n=======================================================\n\n`)
+						logger.info(`\n\n---> CÓDIGO DE PAREAMENTO DO WHATSAPP: ${code} <---\n\n`)
 					} catch (err) {
 						logger.error(err, 'Falha ao solicitar código de pareamento')
 					}
