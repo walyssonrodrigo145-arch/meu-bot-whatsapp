@@ -284,11 +284,42 @@ app.post('/send-message', async (req: any, res: any) => {
             return res.status(503).json({ error: 'Bot do WhatsApp ainda não está pronto ou conectado.' })
         }
 
-        // Formata o número para o padrão JID do WhatsApp
-        const cleanNumber = number.replace(/\D/g, '')
-        const jid = cleanNumber.includes('@s.whatsapp.net') ? cleanNumber : `${cleanNumber}@s.whatsapp.net`
+        // Formata o número limpando caracteres
+        let cleanNumber = number.replace(/\D/g, '')
+        if (!cleanNumber.startsWith('55')) {
+            cleanNumber = '55' + cleanNumber
+        }
+        let jid = `${cleanNumber}@s.whatsapp.net`
 
-        // Dispara a mensagem
+        // Consulta o WhatsApp para descobrir o JID oficial exato (com ou sem o 9)
+        let [waExists] = await currentSock.onWhatsApp(jid)
+
+        if (!waExists?.exists && cleanNumber.startsWith('55') && cleanNumber.length === 13) {
+            // Se tem 13 dígitos (ex: 55 33 98896-2572), tenta remover o 9 após o DDD
+            const semNove = cleanNumber.slice(0, 4) + cleanNumber.slice(5)
+            const [waExistsSemNove] = await currentSock.onWhatsApp(`${semNove}@s.whatsapp.net`)
+            if (waExistsSemNove?.exists) {
+                jid = waExistsSemNove.jid
+                waExists = waExistsSemNove
+            }
+        } else if (!waExists?.exists && cleanNumber.startsWith('55') && cleanNumber.length === 12) {
+            // Se tem 12 dígitos (ex: 55 33 8896-2572), tenta adicionar o 9 após o DDD
+            const comNove = cleanNumber.slice(0, 4) + '9' + cleanNumber.slice(4)
+            const [waExistsComNove] = await currentSock.onWhatsApp(`${comNove}@s.whatsapp.net`)
+            if (waExistsComNove?.exists) {
+                jid = waExistsComNove.jid
+                waExists = waExistsComNove
+            }
+        }
+
+        if (waExists?.exists) {
+            jid = waExists.jid
+            logger.info({ jid }, 'JID oficial validado no WhatsApp com sucesso')
+        } else {
+            logger.warn({ jid }, 'Aviso: Número não encontrado na verificação onWhatsApp, tentando envio direto por fallback...')
+        }
+
+        // Dispara a mensagem para o JID oficial
         const sentMsg = await currentSock.sendMessage(jid, { text: message })
         logger.info({ jid }, 'Lembrete disparado com sucesso via API')
 
