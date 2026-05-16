@@ -4,6 +4,8 @@ import readline from 'readline'
 import makeWASocket, { CacheStore, DEFAULT_CONNECTION_CONFIG, DisconnectReason, fetchLatestBaileysVersion, generateMessageIDV2, getAggregateVotesInPollMessage, isJidNewsletter, makeCacheableSignalKeyStore, proto, useMultiFileAuthState, WAMessageContent, WAMessageKey } from '../src'
 import P from 'pino'
 import qrcode from 'qrcode-terminal'
+import express from 'express'
+import cors from 'cors'
 
 const logger = P({
   level: "trace",
@@ -37,6 +39,9 @@ const onDemandMap = new Map<string, string>()
 const rl = readline.createInterface({ input: process.stdin, output: process.stdout })
 const question = (text: string) => new Promise<string>((resolve) => rl.question(text, resolve))
 
+// Instância global do socket para a API Express
+let currentSock: any = null
+
 // start a connection
 const startSock = async() => {
 	const { state, saveCreds } = await useMultiFileAuthState('baileys_auth_info')
@@ -65,6 +70,8 @@ const startSock = async() => {
 		// implement to handle retries & poll updates
 		getMessage
 	})
+
+	currentSock = sock
 
 	// the process function lets you process all events that just occurred
 	// efficiently in a batch
@@ -237,3 +244,48 @@ const startSock = async() => {
 }
 
 startSock()
+
+// --- CONFIGURAÇÃO DA API EXPRESS PARA DISPARO DE LEMBRETES ---
+const app = express()
+app.use(cors())
+app.use(express.json())
+
+// Rota POST para disparar mensagens do seu site
+app.post('/send-message', async (req: any, res: any) => {
+    try {
+        const { number, message, apiKey } = req.body
+
+        // Verificação simples de segurança (Proteção da API)
+        // Você pode configurar a variável API_KEY no Fly.io (fly secrets set API_KEY=sua_senha)
+        const expectedApiKey = process.env.API_KEY ?? 'minha_chave_secreta_123'
+        if (apiKey !== expectedApiKey) {
+            return res.status(401).json({ error: 'Acesso não autorizado. Chave de API inválida.' })
+        }
+
+        if (!number || !message) {
+            return res.status(400).json({ error: 'Parâmetros "number" e "message" são obrigatórios.' })
+        }
+
+        if (!currentSock) {
+            return res.status(503).json({ error: 'Bot do WhatsApp ainda não está pronto ou conectado.' })
+        }
+
+        // Formata o número para o padrão JID do WhatsApp
+        const cleanNumber = number.replace(/\D/g, '')
+        const jid = cleanNumber.includes('@s.whatsapp.net') ? cleanNumber : `${cleanNumber}@s.whatsapp.net`
+
+        // Dispara a mensagem
+        const sentMsg = await currentSock.sendMessage(jid, { text: message })
+        logger.info({ jid }, 'Lembrete disparado com sucesso via API')
+
+        return res.status(200).json({ success: true, messageId: sentMsg?.key?.id })
+    } catch (error: any) {
+        logger.error(error, 'Erro ao disparar lembrete via API')
+        return res.status(500).json({ error: 'Falha ao enviar mensagem', details: error.message })
+    }
+})
+
+const PORT = process.env.PORT || 8080
+app.listen(PORT, () => {
+    logger.info(`Servidor da API Express rodando na porta ${PORT}`)
+})
