@@ -1,0 +1,19 @@
+# Arquivo de configuração para implantação no Fly.io
+
+app = "meu-bot-whatsapp"
+primary_region = "gru" # Região de São Paulo para menor latência no Brasil
+
+[build]
+  dockerfile = "Dockerfile"
+
+# Configuração de Volume CRÍTICA para bots de WhatsApp:
+# Garante que os dados de autenticação (baileys_auth_info) não sejam apagados
+# quando o container for reiniciado ou atualizado.
+[mounts]
+  source = "baileys_auth"
+  destination = "/app/baileys_auth_info"
+
+# NOTA IMPORTANTE:
+# Como o bot atua em segundo plano (worker) e não sobe um servidor web HTTP,
+# NÃO declaramos a seção [http_service] ou [[services]]. Isso impede que o Fly.io
+# encerre a aplicação por falha nas checagens de porta (healthchecks).
