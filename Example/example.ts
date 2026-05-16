@@ -92,15 +92,14 @@ const startSock = async() => {
 					}
 				}
 
-				if (qr) {
-					// Exibe o QR Code visual no terminal/logs do Fly.io
-					qrcode.generate(qr, { small: true })
-
-					// Pairing code for Web clients
-					if (usePairingCode && !sock.authState.creds.registered) {
-						const phoneNumber = await question('Please enter your phone number:\n')
+				if (qr && !sock.authState.creds.registered) {
+					// Ignora o QR code distorcido da nuvem e solicita o Código de Pareamento
+					const phoneNumber = '5533999958830'
+					try {
 						const code = await sock.requestPairingCode(phoneNumber)
-						console.log(`Pairing code: ${code}`)
+						logger.info(`\n\n=======================================================\nCÓDIGO DE PAREAMENTO DO WHATSAPP: ${code}\n=======================================================\n\n`)
+					} catch (err) {
+						logger.error(err, 'Falha ao solicitar código de pareamento')
 					}
 				}
 
