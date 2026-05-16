@@ -91,10 +91,16 @@ const startSock = async() => {
 
 					// Verifica se é erro 401 (logged out) ou falha de conexão por chaves corrompidas
 					if(statusCode === DisconnectReason.loggedOut || errMsg.includes('401') || errMsg.includes('Connection failure') || errMsg.includes('logged out')) {
-						logger.fatal('Sessão inválida ou corrompida (Erro 401 / Falha de Conexão). Limpando arquivos antigos para gerar novo código...')
+						logger.fatal('Sessão inválida ou corrompida (Erro 401 / Falha de Conexão). Limpando arquivos internos do volume...')
 						try {
-							fs.rmSync('baileys_auth_info', { recursive: true, force: true })
-						} catch (e) {}
+							const files = fs.readdirSync('baileys_auth_info')
+							for (const file of files) {
+								fs.rmSync(`baileys_auth_info/${file}`, { recursive: true, force: true })
+							}
+							logger.info('Arquivos corrompidos do volume limpos com sucesso!')
+						} catch (e: any) {
+							logger.error(e, 'Erro ao limpar arquivos do volume')
+						}
 						setTimeout(() => startSock(), 2000)
 					} else {
 						startSock()
