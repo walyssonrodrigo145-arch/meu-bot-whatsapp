@@ -85,15 +85,19 @@ const startSock = async() => {
 				const update = events['connection.update']
 				const { connection, lastDisconnect, qr } = update
 				if(connection === 'close') {
-					// reconnect if not logged out
-					if((lastDisconnect?.error as Boom)?.output?.statusCode !== DisconnectReason.loggedOut) {
-						startSock()
-					} else {
-						logger.fatal('Sessão inválida ou corrompida (Erro 401). Limpando arquivos antigos para gerar novo código...')
+					const err = lastDisconnect?.error
+					const statusCode = (err as Boom)?.output?.statusCode
+					const errMsg = err?.message || ''
+
+					// Verifica se é erro 401 (logged out) ou falha de conexão por chaves corrompidas
+					if(statusCode === DisconnectReason.loggedOut || errMsg.includes('401') || errMsg.includes('Connection failure') || errMsg.includes('logged out')) {
+						logger.fatal('Sessão inválida ou corrompida (Erro 401 / Falha de Conexão). Limpando arquivos antigos para gerar novo código...')
 						try {
 							fs.rmSync('baileys_auth_info', { recursive: true, force: true })
 						} catch (e) {}
 						setTimeout(() => startSock(), 2000)
+					} else {
+						startSock()
 					}
 				}
 
