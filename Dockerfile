@@ -9,22 +9,19 @@ RUN corepack enable
 # Define o diretório de trabalho dentro do container
 WORKDIR /app
 
-# Copia os arquivos de manifesto e trava de versão
-COPY package.json yarn.lock .yarnrc.yml engine-requirements.js ./
-
-# CRÍTICO: Força o ambiente como development durante a instalação
-# O builder do Fly.io injeta NODE_ENV=production por padrão no ambiente de build.
-# Isso faz o Yarn ignorar as devDependencies (como typescript, tsc-esm-fix e tsx).
-# Sem elas, o comando 'yarn build' falha com código de saída 1 por não encontrar o tsc!
-ENV NODE_ENV=development
-
-# Instala TODAS as dependências (incluindo devDependencies essenciais para o build)
-RUN yarn install --no-immutable
-
-# Copia todo o código-fonte do projeto
+# CRÍTICO PARA O YARN V4 (BERRY): Copia todo o projeto ANTES do yarn install.
+# Como o Baileys é referenciado como workspace (baileys@workspace:.), se rodarmos o yarn install
+# antes de copiar os arquivos do projeto (COPY . .), o Yarn v4 perde a referência do workspace
+# no lockfile e gera o erro: "Internal Error: baileys@workspace:.: This package doesn't seem to be present in your lockfile".
 COPY . .
 
-# Executa o build do TypeScript com o tsc e tsc-esm-fix instalados
+# Força o ambiente como development para garantir a instalação do TypeScript e ferramentas de build
+ENV NODE_ENV=development
+
+# Instala todas as dependências com o projeto completo já presente no diretório
+RUN yarn install --no-immutable
+
+# Executa o build do TypeScript com o workspace perfeitamente linkado
 RUN yarn build
 
 # Define o ambiente final como produção para a execução otimizada do bot
