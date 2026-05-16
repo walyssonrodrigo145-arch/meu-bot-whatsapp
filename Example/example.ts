@@ -3,6 +3,7 @@ import NodeCache from '@cacheable/node-cache'
 import readline from 'readline'
 import makeWASocket, { CacheStore, DEFAULT_CONNECTION_CONFIG, DisconnectReason, fetchLatestBaileysVersion, generateMessageIDV2, getAggregateVotesInPollMessage, isJidNewsletter, makeCacheableSignalKeyStore, proto, useMultiFileAuthState, WAMessageContent, WAMessageKey } from '../src'
 import P from 'pino'
+import qrcode from 'qrcode-terminal'
 
 const logger = P({
   level: "trace",
@@ -85,6 +86,9 @@ const startSock = async() => {
 				}
 
 				if (qr) {
+					// Exibe o QR Code visual no terminal/logs do Fly.io
+					qrcode.generate(qr, { small: true })
+
 					// Pairing code for Web clients
 					if (usePairingCode && !sock.authState.creds.registered) {
 						const phoneNumber = await question('Please enter your phone number:\n')
