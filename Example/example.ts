@@ -6,6 +6,7 @@ import P from 'pino'
 import qrcode from 'qrcode-terminal'
 import express from 'express'
 import cors from 'cors'
+import fs from 'fs'
 
 const logger = P({
   level: "trace",
@@ -88,7 +89,11 @@ const startSock = async() => {
 					if((lastDisconnect?.error as Boom)?.output?.statusCode !== DisconnectReason.loggedOut) {
 						startSock()
 					} else {
-						logger.fatal('Connection closed. You are logged out.')
+						logger.fatal('Sessão inválida ou corrompida (Erro 401). Limpando arquivos antigos para gerar novo código...')
+						try {
+							fs.rmSync('baileys_auth_info', { recursive: true, force: true })
+						} catch (e) {}
+						setTimeout(() => startSock(), 2000)
 					}
 				}
 
