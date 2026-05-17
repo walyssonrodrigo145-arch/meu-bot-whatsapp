@@ -7,15 +7,16 @@ import qrcode from 'qrcode-terminal'
 import express from 'express'
 import cors from 'cors'
 import fs from 'fs'
+import path from 'path'
 
 const logger = P({
-  level: "trace",
+  level: "info", // altered to info to reduce noise on SaaS multi-session logs, but keep trace optional
   transport: {
     targets: [
       {
         target: "pino-pretty", // pretty-print for console
         options: { colorize: true },
-        level: "trace",
+        level: "info",
       },
       {
         target: "pino/file", // raw file output
@@ -25,34 +26,80 @@ const logger = P({
     ],
   },
 })
-logger.level = 'trace'
 
 const doReplies = process.argv.includes('--do-reply')
-const usePairingCode = process.argv.includes('--use-pairing-code')
 
 // external map to store retry counts of messages when decryption/encryption fails
 // keep this out of the socket itself, so as to prevent a message decryption/encryption loop across socket restarts
 const msgRetryCounterCache = new NodeCache() as CacheStore
 
-const onDemandMap = new Map<string, string>()
+// --- MULTI-SESSION ARCHITECTURE SETUP ---
+interface SessionData {
+    sock: any;
+    status: 'PAIRING' | 'CONNECTED' | 'DISCONNECTED';
+    qr?: string;
+    pairingCode?: string;
+    phoneNumber?: string;
+    isClosing?: boolean;
+}
 
-// Read line interface
-const rl = readline.createInterface({ input: process.stdin, output: process.stdout })
-const question = (text: string) => new Promise<string>((resolve) => rl.question(text, resolve))
+const sessions = new Map<string, SessionData>()
 
-// Instância global do socket para a API Express
-let currentSock: any = null
+// Helper to resolve session directory path
+const getAuthPath = (sessionId: string) => {
+	return path.join('baileys_auth_info', sessionId)
+}
 
-// start a connection
-const startSock = async() => {
-	const { state, saveCreds } = await useMultiFileAuthState('baileys_auth_info')
-	// NOTE: For unit testing purposes only
+// Start a connection for a specific sessionId
+const startSock = async (sessionId: string, phoneNumber?: string): Promise<string | undefined> => {
+	// 1. Terminate any pre-existing session and clean up to prevent port or resource leaks
+	const existingSession = sessions.get(sessionId)
+	if (existingSession) {
+		if (existingSession.status === 'CONNECTED' && !phoneNumber) {
+			logger.info(`Sessão [${sessionId}] já conectada na inicialização rápida.`)
+			return
+		}
+		
+		logger.info(`Encerrando conexão socket antiga e pendente para o sessionId: ${sessionId}`)
+		existingSession.isClosing = true // Marca explicitamente para ignorar loops de reconexão fantasma
+		try {
+			if (existingSession.sock) {
+				existingSession.sock.ev.removeAllListeners('connection.update')
+				existingSession.sock.ev.removeAllListeners('creds.update')
+				existingSession.sock.end(undefined)
+			}
+		} catch (e) {
+			logger.error(e, `Erro ao encerrar socket antigo da sessão ${sessionId}`)
+		}
+		sessions.delete(sessionId)
+	}
+
+	const sessionDir = getAuthPath(sessionId)
+
+	// Se for uma chamada explícita de pareamento com número fornecido, limpa as chaves antigas do disco
+	if (phoneNumber && fs.existsSync(sessionDir)) {
+		try {
+			fs.rmSync(sessionDir, { recursive: true, force: true })
+			logger.info(`Limpeza de credenciais antigas no disco concluída para a nova sessão de pareamento: ${sessionId}`)
+		} catch (e) {
+			logger.error(e, `Erro ao limpar diretório físico para pareamento: ${sessionId}`)
+		}
+	}
+
+	// Garante a existência do diretório pai
+	if (!fs.existsSync('baileys_auth_info')) {
+		fs.mkdirSync('baileys_auth_info', { recursive: true })
+	}
+
+	// Inicializa o estado de autenticação de arquivos multi-pasta
+	const { state, saveCreds } = await useMultiFileAuthState(sessionDir)
+
 	if (process.env.ADV_SECRET_KEY) {
 		state.creds.advSecretKey = process.env.ADV_SECRET_KEY
 	}
-	// fetch latest version of WA Web
+
 	const { version, isLatest } = await fetchLatestBaileysVersion()
-	logger.debug({version: version.join('.'), isLatest}, `using latest WA version`)
+	logger.info({ version: version.join('.'), isLatest }, `Iniciando socket Baileys para sessionId: [${sessionId}]`)
 
 	const sock = makeWASocket({
 		version,
@@ -60,277 +107,358 @@ const startSock = async() => {
 		waWebSocketUrl: process.env.SOCKET_URL ?? DEFAULT_CONNECTION_CONFIG.waWebSocketUrl,
 		auth: {
 			creds: state.creds,
-			/** caching makes the store faster to send/recv messages */
 			keys: makeCacheableSignalKeyStore(state.keys, logger),
 		},
 		msgRetryCounterCache,
 		generateHighQualityLinkPreview: true,
-		// ignore all broadcast messages -- to receive the same
-		// comment the line below out
-		// shouldIgnoreJid: jid => isJidBroadcast(jid),
-		// implement to handle retries & poll updates
 		getMessage
 	})
 
-	currentSock = sock
+	// Inicializa o mapa com a nova sessão em estado inicializador
+	sessions.set(sessionId, {
+		sock,
+		status: phoneNumber ? 'PAIRING' : 'DISCONNECTED',
+		phoneNumber,
+		isClosing: false
+	})
 
-	// the process function lets you process all events that just occurred
-	// efficiently in a batch
+	let pairingCodePromise: Promise<string> | undefined
+	if (phoneNumber && !sock.authState.creds.registered) {
+		pairingCodePromise = new Promise(async (resolve, reject) => {
+			try {
+				// Pequeno delay para garantir que o socket estabeleça conexão interna básica
+				await new Promise(resolveTimeout => setTimeout(resolveTimeout, 1500))
+				const code = await sock.requestPairingCode(phoneNumber)
+				
+				const current = sessions.get(sessionId)
+				if (current && !current.isClosing) {
+					current.pairingCode = code
+					current.status = 'PAIRING'
+				}
+				logger.info(`\n\n---> CÓDIGO DE PAREAMENTO WHATSAPP PARA [${sessionId}]: ${code} <---\n\n`)
+				resolve(code)
+			} catch (err) {
+				reject(err)
+			}
+		})
+	}
+
 	sock.ev.process(
-		// events is a map for event name => event data
-		async(events) => {
-			// something about the connection changed
-			// maybe it closed, or we received all offline message or connection opened
-			if(events['connection.update']) {
+		async (events) => {
+			if (events['connection.update']) {
 				const update = events['connection.update']
 				const { connection, lastDisconnect, qr } = update
-				if(connection === 'close') {
+				const current = sessions.get(sessionId)
+
+				// Se a sessão foi marcada para encerramento intencional, ignora qualquer processamento
+				if (current?.isClosing) {
+					logger.info(`Sessão [${sessionId}] ignorando connection.update de encerramento intencional.`)
+					return
+				}
+
+				if (connection === 'open') {
+					logger.info(`Sessão do professor [${sessionId}] CONECTADA com sucesso!`)
+					if (current) {
+						current.status = 'CONNECTED'
+						current.pairingCode = undefined
+						if (sock.user?.id) {
+							current.phoneNumber = sock.user.id.split(':')[0]
+						}
+					}
+				}
+
+				if (connection === 'close') {
 					const err = lastDisconnect?.error
 					const statusCode = (err as Boom)?.output?.statusCode
 					const errMsg = err?.message || ''
 
-					// Verifica se é erro 401 (logged out) ou falha de conexão por chaves corrompidas
-					if(statusCode === DisconnectReason.loggedOut || errMsg.includes('401') || errMsg.includes('Connection failure') || errMsg.includes('logged out')) {
-						logger.fatal('Sessão inválida ou corrompida (Erro 401 / Falha de Conexão). Limpando arquivos internos do volume...')
+					// Tratamento de sessão inválida / deslogada definitivamente
+					if (statusCode === DisconnectReason.loggedOut || errMsg.includes('401') || errMsg.includes('Connection failure') || errMsg.includes('logged out')) {
+						logger.warn(`Sessão [${sessionId}] foi deslogada no celular ou chaves corrompidas (Erro 401). Limpando dados do disco...`)
 						try {
-							const files = fs.readdirSync('baileys_auth_info')
-							for (const file of files) {
-								fs.rmSync(`baileys_auth_info/${file}`, { recursive: true, force: true })
+							if (fs.existsSync(sessionDir)) {
+								fs.rmSync(sessionDir, { recursive: true, force: true })
 							}
-							logger.info('Arquivos corrompidos do volume limpos com sucesso!')
-						} catch (e: any) {
-							logger.error(e, 'Erro ao limpar arquivos do volume')
+						} catch (e) {
+							logger.error(e, `Erro ao limpar arquivos da pasta ${sessionDir}`)
 						}
-						setTimeout(() => startSock(), 2000)
+						sessions.delete(sessionId)
 					} else {
-						startSock()
+						// Erro de rede temporário, tenta restabelecer a conexão apenas se não estiver em encerramento
+						logger.info(`Sessão [${sessionId}] desconectada temporariamente. Tentando restabelecer conexão em 3s...`)
+						setTimeout(() => {
+							const checkSess = sessions.get(sessionId)
+							if (!checkSess?.isClosing) {
+								startSock(sessionId).catch(() => {})
+							}
+						}, 3000)
 					}
 				}
 
-				if (qr && !sock.authState.creds.registered) {
-					// Ignora o QR code distorcido da nuvem e solicita o Código de Pareamento
-					const phoneNumber = '553399958830'
-					try {
-						const code = await sock.requestPairingCode(phoneNumber)
-						logger.info(`\n\n---> CÓDIGO DE PAREAMENTO DO WHATSAPP: ${code} <---\n\n`)
-					} catch (err) {
-						logger.error(err, 'Falha ao solicitar código de pareamento')
-					}
+				logger.debug(update, `Connection update para sessionId: ${sessionId}`)
+			}
+
+			if (events['creds.update']) {
+				const current = sessions.get(sessionId)
+				if (!current?.isClosing) {
+					await saveCreds()
+					logger.debug({}, `Credenciais salvas no disco para sessionId: ${sessionId}`)
 				}
-
-				logger.debug(update, 'connection update')
 			}
 
-			// credentials updated -- save them
-			if(events['creds.update']) {
-				await saveCreds()
-				logger.debug({}, 'creds save triggered')
-			}
-
-			if(events['labels.association']) {
-				logger.debug(events['labels.association'], 'labels.association event fired')
-			}
-
-
-			if(events['labels.edit']) {
-				logger.debug(events['labels.edit'], 'labels.edit event fired')
-			}
-
-			if(events['call']) {
-				logger.debug(events['call'], 'call event fired')
-			}
-
-			// history received
-			if(events['messaging-history.set']) {
-				const { chats, contacts, messages, isLatest, progress, syncType } = events['messaging-history.set']
-				if (syncType === proto.HistorySync.HistorySyncType.ON_DEMAND) {
-					logger.debug(messages, 'received on-demand history sync')
-				}
-				logger.debug({contacts: contacts.length, chats: chats.length, messages: messages.length, isLatest, progress, syncType: syncType?.toString() }, 'messaging-history.set event fired')
-			}
-
-			// received a new message
-      if (events['messages.upsert']) {
-        const upsert = events['messages.upsert']
-        logger.debug(upsert, 'messages.upsert fired')
-
-        if (!!upsert.requestId) {
-          logger.debug(upsert, 'placeholder request message received')
-        }
-
-
-
-        if (upsert.type === 'notify') {
-          for (const msg of upsert.messages) {
-            if (msg.message?.conversation || msg.message?.extendedTextMessage?.text) {
-              const text = msg.message?.conversation || msg.message?.extendedTextMessage?.text
-              if (text == "requestPlaceholder" && !upsert.requestId) {
-                const messageId = await sock.requestPlaceholderResend(msg.key)
-								logger.debug({ id: messageId }, 'requested placeholder resync')
-              }
-
-              // go to an old chat and send this
-              if (text == "onDemandHistSync") {
-                const messageId = await sock.fetchMessageHistory(50, msg.key, msg.messageTimestamp!)
-                logger.debug({ id: messageId }, 'requested on-demand history resync')
-              }
-
-              if (!msg.key.fromMe && doReplies && !isJidNewsletter(msg.key?.remoteJid!)) {
-              	const id = generateMessageIDV2(sock.user?.id)
-              	logger.debug({id, orig_id: msg.key.id }, 'replying to message')
-                await sock.sendMessage(msg.key.remoteJid!, { text: 'pong '+msg.key.id }, {messageId: id })
-              }
-            }
-          }
-        }
-      }
-
-			// messages updated like status delivered, message deleted etc.
-			if(events['messages.update']) {
-				logger.debug(events['messages.update'], 'messages.update fired')
-
-				for(const { key, update } of events['messages.update']) {
-					if(update.pollUpdates) {
-						const pollCreation: proto.IMessage = {} // get the poll creation message somehow
-						if(pollCreation) {
-							console.log(
-								'got poll update, aggregation: ',
-								getAggregateVotesInPollMessage({
-									message: pollCreation,
-									pollUpdates: update.pollUpdates,
-								})
-							)
+			// Resposta automática de teste opcional (ativado por flag --do-reply)
+			if (events['messages.upsert']) {
+				const upsert = events['messages.upsert']
+				if (upsert.type === 'notify' && doReplies) {
+					for (const msg of upsert.messages) {
+						if (!msg.key.fromMe && !isJidNewsletter(msg.key?.remoteJid!)) {
+							const text = msg.message?.conversation || msg.message?.extendedTextMessage?.text
+							if (text === 'ping') {
+								const id = generateMessageIDV2(sock.user?.id)
+								await sock.sendMessage(msg.key.remoteJid!, { text: 'pong' }, { messageId: id })
+							}
 						}
 					}
 				}
-			}
-
-			if(events['message-receipt.update']) {
-				logger.debug(events['message-receipt.update'])
-			}
-
-			if (events['contacts.upsert']) {
-				logger.debug(events['message-receipt.update'])
-			}
-
-			if(events['messages.reaction']) {
-				logger.debug(events['messages.reaction'])
-			}
-
-			if(events['presence.update']) {
-				logger.debug(events['presence.update'])
-			}
-
-			if(events['chats.update']) {
-				logger.debug(events['chats.update'])
-			}
-
-			if(events['contacts.update']) {
-				for(const contact of events['contacts.update']) {
-					if(typeof contact.imgUrl !== 'undefined') {
-						const newUrl = contact.imgUrl === null
-							? null
-							: await sock!.profilePictureUrl(contact.id!).catch(() => null)
-						logger.debug({id: contact.id, newUrl}, `contact has a new profile pic` )
-					}
-				}
-			}
-
-			if(events['chats.delete']) {
-				logger.debug('chats deleted ', events['chats.delete'])
-			}
-
-			if(events['group.member-tag.update']) {
-				logger.debug('group member tag update', JSON.stringify(events['group.member-tag.update'], undefined, 2))
 			}
 		}
 	)
 
-	return sock
+	if (pairingCodePromise) {
+		return await pairingCodePromise
+	}
+	return undefined
 
 	async function getMessage(key: WAMessageKey): Promise<WAMessageContent | undefined> {
-	  // Implement a way to retreive messages that were upserted from messages.upsert
-			// up to you
-
-		// only if store is present
 		return proto.Message.create({ conversation: 'test' })
 	}
 }
 
-startSock()
+// --- ROTINA DE RESTAURO AUTOMÁTICO (BOOT) ---
+const restoreSessions = async () => {
+	if (!fs.existsSync('baileys_auth_info')) {
+		fs.mkdirSync('baileys_auth_info', { recursive: true })
+		return
+	}
+	const dirs = fs.readdirSync('baileys_auth_info')
+	for (const dir of dirs) {
+		const fullPath = path.join('baileys_auth_info', dir)
+		if (fs.statSync(fullPath).isDirectory()) {
+			logger.info(`[BOOT] Restaurando sessão anterior ativa do professor: ${dir}`)
+			startSock(dir).catch(err => {
+				logger.error(err, `Erro ao restaurar sessão de inicialização rápida para ${dir}`)
+			})
+		}
+	}
+}
 
-// --- CONFIGURAÇÃO DA API EXPRESS PARA DISPARO DE LEMBRETES ---
+// Executa o boot automático
+restoreSessions().then(() => {
+	logger.info('Rotina de restauro automático de sessões em andamento (segundo plano).')
+}).catch(err => {
+	logger.error(err, 'Erro na inicialização da rotina de boot automático')
+})
+
+
+// --- CONFIGURAÇÃO DA API EXPRESS MULTI-SESSÃO ---
 const app = express()
 app.use(cors())
 app.use(express.json())
 
-// Rota POST para disparar mensagens do seu site
+const expectedApiKey = process.env.API_KEY ?? 'minha_chave_secreta_123'
+
+// Middleware simples de autenticação
+const validateApiKey = (req: any, res: any) => {
+	const { apiKey } = req.body
+	if (apiKey !== expectedApiKey) {
+		res.status(401).json({ error: 'Acesso não autorizado. Chave de API inválida.' })
+		return false
+	}
+	return true
+}
+
+// 1. Iniciar ou Reiniciar Pareamento (POST /sessions/start)
+app.post('/sessions/start', async (req: any, res: any) => {
+	try {
+		if (!validateApiKey(req, res)) return
+
+		const { sessionId, phoneNumber } = req.body
+		if (!sessionId || !phoneNumber) {
+			return res.status(400).json({ error: 'Parâmetros "sessionId" e "phoneNumber" são obrigatórios.' })
+		}
+
+		// Formata o número limpando caracteres
+		let cleanNumber = phoneNumber.replace(/\D/g, '')
+		if (!cleanNumber.startsWith('55')) {
+			cleanNumber = '55' + cleanNumber
+		}
+
+		// Se já está conectado e pronto
+		const sess = sessions.get(sessionId)
+		if (sess && sess.status === 'CONNECTED') {
+			return res.status(200).json({
+				success: true,
+				sessionId,
+				status: 'CONNECTED',
+				phone: sess.phoneNumber,
+				message: 'WhatsApp já está conectado e pronto para disparos.'
+			})
+		}
+
+		logger.info(`Iniciando geração de pareamento para a sessão [${sessionId}] no número ${cleanNumber}...`)
+		const code = await startSock(sessionId, cleanNumber)
+
+		return res.status(200).json({
+			success: true,
+			sessionId,
+			status: 'PAIRING',
+			pairingCode: code,
+			message: 'Código gerado com sucesso. Digite no celular em até 60 segundos.'
+		})
+	} catch (error: any) {
+		logger.error(error, `Erro ao iniciar pareamento para o sessionId: ${req.body?.sessionId}`)
+		return res.status(500).json({ error: 'Falha ao iniciar pareamento do WhatsApp', details: error.message })
+	}
+})
+
+// 2. Consultar Status da Conexão (POST /sessions/status)
+app.post('/sessions/status', async (req: any, res: any) => {
+	try {
+		if (!validateApiKey(req, res)) return
+
+		const { sessionId } = req.body
+		if (!sessionId) {
+			return res.status(400).json({ error: 'Parâmetro "sessionId" é obrigatório.' })
+		}
+
+		const sess = sessions.get(sessionId)
+		if (!sess) {
+			return res.status(404).json({
+				sessionId,
+				status: 'DISCONNECTED',
+				message: 'Sessão inexistente ou não inicializada.'
+			})
+		}
+
+		return res.status(200).json({
+			sessionId,
+			status: sess.status,
+			phone: sess.phoneNumber,
+			pairingCode: sess.pairingCode,
+			message: sess.status === 'CONNECTED'
+				? 'WhatsApp conectado e pronto para disparos.'
+				: (sess.status === 'PAIRING' ? 'Aguardando digitação do código de pareamento no celular.' : 'Sessão desconectada.')
+		})
+	} catch (error: any) {
+		logger.error(error, `Erro ao consultar status da sessão: ${req.body?.sessionId}`)
+		return res.status(500).json({ error: 'Falha ao consultar status da sessão', details: error.message })
+	}
+})
+
+// 3. Disparar Lembrete por Sessão Específica (POST /send-message)
 app.post('/send-message', async (req: any, res: any) => {
-    try {
-        const { number, message, apiKey } = req.body
+	try {
+		if (!validateApiKey(req, res)) return
 
-        // Verificação simples de segurança (Proteção da API)
-        // Você pode configurar a variável API_KEY no Fly.io (fly secrets set API_KEY=sua_senha)
-        const expectedApiKey = process.env.API_KEY ?? 'minha_chave_secreta_123'
-        if (apiKey !== expectedApiKey) {
-            return res.status(401).json({ error: 'Acesso não autorizado. Chave de API inválida.' })
-        }
+		const { sessionId, number, message } = req.body
+		if (!sessionId || !number || !message) {
+			return res.status(400).json({ error: 'Parâmetros "sessionId", "number" e "message" são obrigatórios.' })
+		}
 
-        if (!number || !message) {
-            return res.status(400).json({ error: 'Parâmetros "number" e "message" são obrigatórios.' })
-        }
+		const sess = sessions.get(sessionId)
+		if (!sess || sess.status !== 'CONNECTED' || !sess.sock) {
+			return res.status(503).json({ error: `Sessão [${sessionId}] do WhatsApp não está ativa ou não existe.` })
+		}
 
-        if (!currentSock) {
-            return res.status(503).json({ error: 'Bot do WhatsApp ainda não está pronto ou conectado.' })
-        }
+		const sock = sess.sock
 
-        // Formata o número limpando caracteres
-        let cleanNumber = number.replace(/\D/g, '')
-        if (!cleanNumber.startsWith('55')) {
-            cleanNumber = '55' + cleanNumber
-        }
-        let jid = `${cleanNumber}@s.whatsapp.net`
+		// Limpa caracteres do número
+		let cleanNumber = number.replace(/\D/g, '')
+		if (!cleanNumber.startsWith('55')) {
+			cleanNumber = '55' + cleanNumber
+		}
+		let jid = `${cleanNumber}@s.whatsapp.net`
 
-        // Consulta o WhatsApp para descobrir o JID oficial exato (com ou sem o 9)
-        let [waExists] = await currentSock.onWhatsApp(jid)
+		// Valida se o número é oficial no WhatsApp
+		let [waExists] = await sock.onWhatsApp(jid)
 
-        if (!waExists?.exists && cleanNumber.startsWith('55') && cleanNumber.length === 13) {
-            // Se tem 13 dígitos (ex: 55 33 98896-2572), tenta remover o 9 após o DDD
-            const semNove = cleanNumber.slice(0, 4) + cleanNumber.slice(5)
-            const [waExistsSemNove] = await currentSock.onWhatsApp(`${semNove}@s.whatsapp.net`)
-            if (waExistsSemNove?.exists) {
-                jid = waExistsSemNove.jid
-                waExists = waExistsSemNove
-            }
-        } else if (!waExists?.exists && cleanNumber.startsWith('55') && cleanNumber.length === 12) {
-            // Se tem 12 dígitos (ex: 55 33 8896-2572), tenta adicionar o 9 após o DDD
-            const comNove = cleanNumber.slice(0, 4) + '9' + cleanNumber.slice(4)
-            const [waExistsComNove] = await currentSock.onWhatsApp(`${comNove}@s.whatsapp.net`)
-            if (waExistsComNove?.exists) {
-                jid = waExistsComNove.jid
-                waExists = waExistsComNove
-            }
-        }
+		if (!waExists?.exists && cleanNumber.startsWith('55') && cleanNumber.length === 13) {
+			// Tenta remover o dígito 9 após o DDD se for 13 dígitos
+			const semNove = cleanNumber.slice(0, 4) + cleanNumber.slice(5)
+			const [waExistsSemNove] = await sock.onWhatsApp(`${semNove}@s.whatsapp.net`)
+			if (waExistsSemNove?.exists) {
+				jid = waExistsSemNove.jid
+				waExists = waExistsSemNove
+			}
+		} else if (!waExists?.exists && cleanNumber.startsWith('55') && cleanNumber.length === 12) {
+			// Tenta adicionar o dígito 9 após o DDD se for 12 dígitos
+			const comNove = cleanNumber.slice(0, 4) + '9' + cleanNumber.slice(4)
+			const [waExistsComNove] = await sock.onWhatsApp(`${comNove}@s.whatsapp.net`)
+			if (waExistsComNove?.exists) {
+				jid = waExistsComNove.jid
+				waExists = waExistsComNove
+			}
+		}
 
-        if (waExists?.exists) {
-            jid = waExists.jid
-            logger.info({ jid }, 'JID oficial validado no WhatsApp com sucesso')
-        } else {
-            logger.warn({ jid }, 'Aviso: Número não encontrado na verificação onWhatsApp, tentando envio direto por fallback...')
-        }
+		if (waExists?.exists) {
+			jid = waExists.jid
+			logger.info({ jid }, `JID oficial validado com sucesso via WhatsApp para a sessão ${sessionId}`)
+		} else {
+			logger.warn({ jid }, `Aviso: Número não validado no onWhatsApp, enviando por fallback para a sessão ${sessionId}...`)
+		}
 
-        // Dispara a mensagem para o JID oficial
-        const sentMsg = await currentSock.sendMessage(jid, { text: message })
-        logger.info({ jid }, 'Lembrete disparado com sucesso via API')
+		// Dispara a mensagem
+		const sentMsg = await sock.sendMessage(jid, { text: message })
+		logger.info({ jid }, `Lembrete enviado com sucesso pela sessão ${sessionId}`)
 
-        return res.status(200).json({ success: true, messageId: sentMsg?.key?.id })
-    } catch (error: any) {
-        logger.error(error, 'Erro ao disparar lembrete via API')
-        return res.status(500).json({ error: 'Falha ao enviar mensagem', details: error.message })
-    }
+		return res.status(200).json({ success: true, sessionId, messageId: sentMsg?.key?.id })
+	} catch (error: any) {
+		logger.error(error, `Erro ao disparar lembrete via API para a sessão: ${req.body?.sessionId}`)
+		return res.status(500).json({ error: 'Falha ao enviar mensagem', details: error.message })
+	}
+})
+
+// 4. Encerrar e Deletar Sessão (POST /sessions/logout)
+app.post('/sessions/logout', async (req: any, res: any) => {
+	try {
+		if (!validateApiKey(req, res)) return
+
+		const { sessionId } = req.body
+		if (!sessionId) {
+			return res.status(400).json({ error: 'Parâmetro "sessionId" é obrigatório.' })
+		}
+
+		const sess = sessions.get(sessionId)
+		if (sess) {
+			try {
+				if (sess.sock) {
+					sess.sock.ev.removeAllListeners('connection.update')
+					sess.sock.ev.removeAllListeners('creds.update')
+					await sess.sock.logout().catch(() => {})
+				}
+			} catch (e) {}
+			sessions.delete(sessionId)
+		}
+
+		// Remove os arquivos físicos da sessão deslogada permanentemente
+		const sessionDir = getAuthPath(sessionId)
+		if (fs.existsSync(sessionDir)) {
+			try {
+				fs.rmSync(sessionDir, { recursive: true, force: true })
+				logger.info(`Arquivos da pasta de autenticação da sessão deslogada foram removidos: ${sessionId}`)
+			} catch (e) {
+				logger.error(e, `Erro ao limpar arquivos físicos da sessão deslogada ${sessionId}`)
+			}
+		}
+
+		return res.status(200).json({ success: true, message: 'Sessão encerrada e arquivos removidos com sucesso.' })
+	} catch (error: any) {
+		logger.error(error, `Erro ao encerrar sessão: ${req.body?.sessionId}`)
+		return res.status(500).json({ error: 'Falha ao encerrar sessão', details: error.message })
+	}
 })
 
 const PORT = process.env.PORT || 8080
 app.listen(PORT, () => {
-    logger.info(`Servidor da API Express rodando na porta ${PORT}`)
+    logger.info(`Servidor da API Express Multi-Sessão rodando na porta ${PORT}`)
 })
