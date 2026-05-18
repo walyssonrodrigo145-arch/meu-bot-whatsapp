@@ -54,6 +54,10 @@ const getAuthPath = (sessionId: string) => {
 const startSock = async (sessionId: string, phoneNumber?: string): Promise<string | undefined> => {
 	// 1. Terminate any pre-existing session and clean up to prevent port or resource leaks
 	const existingSession = sessions.get(sessionId)
+	const previousPhone = phoneNumber || existingSession?.phoneNumber
+	const previousPairingCode = existingSession?.pairingCode
+	const previousQr = existingSession?.qr
+
 	if (existingSession) {
 		if (existingSession.status === 'CONNECTED' && !phoneNumber) {
 			logger.info(`Sessão [${sessionId}] já conectada na inicialização rápida.`)
@@ -114,21 +118,23 @@ const startSock = async (sessionId: string, phoneNumber?: string): Promise<strin
 		getMessage
 	})
 
-	// Inicializa o mapa com a nova sessão em estado inicializador
+	// Inicializa o mapa com a nova sessão preservando os dados anteriores
 	sessions.set(sessionId, {
 		sock,
 		status: 'PAIRING',
-		phoneNumber,
+		phoneNumber: previousPhone,
+		pairingCode: previousPairingCode,
+		qr: previousQr,
 		isClosing: false
 	})
 
 	let pairingCodePromise: Promise<string> | undefined
-	if (phoneNumber && !sock.authState.creds.registered) {
+	if (previousPhone && !sock.authState.creds.registered) {
 		pairingCodePromise = new Promise(async (resolve, reject) => {
 			try {
 				// Pequeno delay para garantir que o socket estabeleça conexão interna básica
 				await new Promise(resolveTimeout => setTimeout(resolveTimeout, 1500))
-				const code = await sock.requestPairingCode(phoneNumber)
+				const code = await sock.requestPairingCode(previousPhone)
 				
 				const current = sessions.get(sessionId)
 				if (current && !current.isClosing) {
@@ -199,7 +205,7 @@ const startSock = async (sessionId: string, phoneNumber?: string): Promise<strin
 						setTimeout(() => {
 							const checkSess = sessions.get(sessionId)
 							if (!checkSess?.isClosing) {
-								startSock(sessionId).catch(() => {})
+								startSock(sessionId, checkSess?.phoneNumber).catch(() => {})
 							}
 						}, 3000)
 					}
