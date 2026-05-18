@@ -117,7 +117,7 @@ const startSock = async (sessionId: string, phoneNumber?: string): Promise<strin
 	// Inicializa o mapa com a nova sessão em estado inicializador
 	sessions.set(sessionId, {
 		sock,
-		status: phoneNumber ? 'PAIRING' : 'DISCONNECTED',
+		status: 'PAIRING',
 		phoneNumber,
 		isClosing: false
 	})
@@ -156,11 +156,18 @@ const startSock = async (sessionId: string, phoneNumber?: string): Promise<strin
 					return
 				}
 
+				if (qr && current) {
+					current.qr = qr
+					current.status = 'PAIRING'
+					logger.info(`Sessão [${sessionId}]: Novo QR Code gerado com sucesso.`)
+				}
+
 				if (connection === 'open') {
 					logger.info(`Sessão do professor [${sessionId}] CONECTADA com sucesso!`)
 					if (current) {
 						current.status = 'CONNECTED'
 						current.pairingCode = undefined
+						current.qr = undefined
 						if (sock.user?.id) {
 							current.phoneNumber = sock.user.id.split(':')[0]
 						}
@@ -286,14 +293,17 @@ app.post('/sessions/start', async (req: any, res: any) => {
 		if (!validateApiKey(req, res)) return
 
 		const { sessionId, phoneNumber } = req.body
-		if (!sessionId || !phoneNumber) {
-			return res.status(400).json({ error: 'Parâmetros "sessionId" e "phoneNumber" são obrigatórios.' })
+		if (!sessionId) {
+			return res.status(400).json({ error: 'Parâmetro "sessionId" é obrigatório.' })
 		}
 
-		// Formata o número limpando caracteres
-		let cleanNumber = phoneNumber.replace(/\D/g, '')
-		if (!cleanNumber.startsWith('55')) {
-			cleanNumber = '55' + cleanNumber
+		// Formata o número se fornecido
+		let cleanNumber: string | undefined = undefined
+		if (phoneNumber) {
+			cleanNumber = phoneNumber.replace(/\D/g, '')
+			if (!cleanNumber.startsWith('55')) {
+				cleanNumber = '55' + cleanNumber
+			}
 		}
 
 		// Se já está conectado e pronto
@@ -308,13 +318,28 @@ app.post('/sessions/start', async (req: any, res: any) => {
 			})
 		}
 
-		logger.info(`Iniciando geração de pareamento para a sessão [${sessionId}] no número ${cleanNumber}...`)
+		logger.info(`Iniciando pareamento para a sessão [${sessionId}] (Modo: ${cleanNumber ? 'Código de Pareamento' : 'QR Code'})...`)
 		const code = await startSock(sessionId, cleanNumber)
+
+		if (!cleanNumber) {
+			// Aguarda 1.5s para dar tempo de o primeiro QR Code ser emitido no connection.update
+			await new Promise(r => setTimeout(r, 1500))
+			const updatedSess = sessions.get(sessionId)
+			return res.status(200).json({
+				success: true,
+				sessionId,
+				status: 'PAIRING',
+				mode: 'QR_CODE',
+				qr: updatedSess?.qr,
+				message: updatedSess?.qr ? 'QR Code gerado com sucesso. Escaneie com o celular.' : 'Aguardando geração do QR Code. Consulte /sessions/status.'
+			})
+		}
 
 		return res.status(200).json({
 			success: true,
 			sessionId,
 			status: 'PAIRING',
+			mode: 'PAIRING_CODE',
 			pairingCode: code,
 			message: 'Código gerado com sucesso. Digite no celular em até 60 segundos.'
 		})
@@ -348,9 +373,11 @@ app.post('/sessions/status', async (req: any, res: any) => {
 			status: sess.status,
 			phone: sess.phoneNumber,
 			pairingCode: sess.pairingCode,
+			qr: sess.qr,
+			mode: sess.pairingCode ? 'PAIRING_CODE' : (sess.qr ? 'QR_CODE' : 'NONE'),
 			message: sess.status === 'CONNECTED'
 				? 'WhatsApp conectado e pronto para disparos.'
-				: (sess.status === 'PAIRING' ? 'Aguardando digitação do código de pareamento no celular.' : 'Sessão desconectada.')
+				: (sess.status === 'PAIRING' ? (sess.pairingCode ? 'Aguardando digitação do código no celular.' : 'Aguardando escaneamento do QR Code.') : 'Sessão desconectada.')
 		})
 	} catch (error: any) {
 		logger.error(error, `Erro ao consultar status da sessão: ${req.body?.sessionId}`)
