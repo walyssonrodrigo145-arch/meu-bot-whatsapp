@@ -888,6 +888,10 @@ export const makeSocket = (config: SocketConfig) => {
 
 			const refNode = refNodes.shift()
 			if (!refNode) {
+				if (authState.creds.pairingCode) {
+					logger.info('QR refs attempts ended, but pairing code is active. Keeping socket open for mobile pairing...')
+					return
+				}
 				void end(new Boom('QR refs attempts ended', { statusCode: DisconnectReason.timedOut }))
 				return
 			}
