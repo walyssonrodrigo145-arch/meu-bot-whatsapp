@@ -1,7 +1,7 @@
 import { Boom } from '@hapi/boom'
 import NodeCache from '@cacheable/node-cache'
 import readline from 'readline'
-import makeWASocket, { CacheStore, DEFAULT_CONNECTION_CONFIG, DisconnectReason, fetchLatestBaileysVersion, generateMessageIDV2, getAggregateVotesInPollMessage, isJidNewsletter, makeCacheableSignalKeyStore, proto, useMultiFileAuthState, WAMessageContent, WAMessageKey } from '../src'
+import makeWASocket, { CacheStore, DEFAULT_CONNECTION_CONFIG, DisconnectReason, fetchLatestBaileysVersion, fetchLatestWaWebVersion, generateMessageIDV2, getAggregateVotesInPollMessage, isJidNewsletter, makeCacheableSignalKeyStore, proto, useMultiFileAuthState, WAMessageContent, WAMessageKey } from '../src'
 import P from 'pino'
 import qrcode from 'qrcode-terminal'
 import express from 'express'
@@ -103,7 +103,7 @@ const startSock = async (sessionId: string, phoneNumber?: string, isNewPairingRe
 		state.creds.advSecretKey = process.env.ADV_SECRET_KEY
 	}
 
-	const { version, isLatest } = await fetchLatestBaileysVersion()
+	const { version, isLatest } = await fetchLatestWaWebVersion()
 	logger.info({ version: version.join('.'), isLatest }, `Iniciando socket Baileys para sessionId: [${sessionId}]`)
 
 	const sock = makeWASocket({
@@ -131,27 +131,17 @@ const startSock = async (sessionId: string, phoneNumber?: string, isNewPairingRe
 
 	let pairingCodePromise: Promise<string> | undefined
 	if (previousPhone && !sock.authState.creds.registered) {
-		logger.info(`Aguardando abertura real do túnel WebSocket (connected to WA) para solicitar código de pareamento para ${previousPhone}...`)
+		logger.info(`Aguardando abertura real do túnel WebSocket e handshake Noise para solicitar código de pareamento para ${previousPhone}...`)
 		pairingCodePromise = new Promise(async (resolve, reject) => {
 			try {
-				// Loop inteligente de checagem ativa: verifica a cada 100ms se o WebSocket interno do Baileys já está OPEN (pronto)
-				// ou aguarda até 2500ms (tempo mais que suficiente para o 'connected to WA' ocorrer no Fly.io)
-				let attempts = 0
-				while (attempts < 25) {
-					// Verifica se o socket interno (sock.ws ou sock.socket) está aberto
-					const isOpen = (sock as any).ws?.isOpen || (sock as any).ws?.readyState === 1 || (sock as any).socket?.readyState === 1
-					if (isOpen) {
-						logger.info(`[Tentativa ${attempts + 1}] Túnel WebSocket confirmado como OPEN. Solicitando código de pareamento de 8 dígitos...`)
-						break
-					}
-					await new Promise(r => setTimeout(r, 100))
-					attempts++
-				}
+				// 1. Aguarda a abertura oficial do socket via método nativo do Baileys
+				await sock.waitForSocketOpen()
+				logger.info(`Túnel WebSocket aberto. Aguardando 1500ms para conclusão do handshake criptográfico Noise...`)
+				
+				// 2. Aguarda 1500ms para garantir que o servidor do WhatsApp concluiu o registro inicial e o Noise está sincronizado
+				await new Promise(r => setTimeout(r, 1500))
 
-				if (attempts >= 25) {
-					logger.info(`Aviso: Verificação ativa atingiu 2500ms. Prosseguindo com a solicitação de código de pareamento...`)
-				}
-
+				logger.info(`Solicitando código de pareamento de 8 dígitos para o número ${previousPhone}...`)
 				const code = await sock.requestPairingCode(previousPhone)
 				const current = sessions.get(sessionId)
 				if (current && !current.isClosing) {
@@ -364,16 +354,27 @@ app.post('/sessions/start', async (req: any, res: any) => {
 		const code = await startSock(sessionId, cleanNumber, true)
 
 		if (!cleanNumber) {
-			// Aguarda 1.5s para dar tempo de o primeiro QR Code ser emitido no connection.update
-			await new Promise(r => setTimeout(r, 1500))
+			// Polling inteligente: aguarda até 6 segundos (30 tentativas de 200ms) pela geração do QR Code no connection.update
+			let attempts = 0
+			let qrCode: string | undefined = undefined
+			while (attempts < 30) {
+				const checkSess = sessions.get(sessionId)
+				if (checkSess?.qr) {
+					qrCode = checkSess.qr
+					break
+				}
+				await new Promise(r => setTimeout(r, 200))
+				attempts++
+			}
+
 			const updatedSess = sessions.get(sessionId)
 			return res.status(200).json({
 				success: true,
 				sessionId,
 				status: 'PAIRING',
 				mode: 'QR_CODE',
-				qr: updatedSess?.qr,
-				message: updatedSess?.qr ? 'QR Code gerado com sucesso. Escaneie com o celular.' : 'Aguardando geração do QR Code. Consulte /sessions/status.'
+				qr: qrCode || updatedSess?.qr,
+				message: (qrCode || updatedSess?.qr) ? 'QR Code gerado com sucesso. Escaneie com o celular.' : 'Aguardando geração do QR Code. Consulte /sessions/status.'
 			})
 		}
 
