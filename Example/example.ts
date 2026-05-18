@@ -131,22 +131,18 @@ const startSock = async (sessionId: string, phoneNumber?: string, isNewPairingRe
 
 	let pairingCodePromise: Promise<string> | undefined
 	if (previousPhone && !sock.authState.creds.registered) {
-		pairingCodePromise = new Promise(async (resolve, reject) => {
-			try {
-				// Pequeno delay para garantir que o socket estabeleça conexão interna básica
-				await new Promise(resolveTimeout => setTimeout(resolveTimeout, 1500))
-				const code = await sock.requestPairingCode(previousPhone)
-				
-				const current = sessions.get(sessionId)
-				if (current && !current.isClosing) {
-					current.pairingCode = code
-					current.status = 'PAIRING'
-				}
-				logger.info(`\n\n---> CÓDIGO DE PAREAMENTO WHATSAPP PARA [${sessionId}]: ${code} <---\n\n`)
-				resolve(code)
-			} catch (err) {
-				reject(err)
+		logger.info(`Solicitando código de pareamento para o número ${previousPhone}...`)
+		pairingCodePromise = sock.requestPairingCode(previousPhone).then((code) => {
+			const current = sessions.get(sessionId)
+			if (current && !current.isClosing) {
+				current.pairingCode = code
+				current.status = 'PAIRING'
 			}
+			logger.info(`\n\n---> CÓDIGO DE PAREAMENTO WHATSAPP PARA [${sessionId}]: ${code} <---\n\n`)
+			return code
+		}).catch((err) => {
+			logger.error(err, `Erro ao solicitar código de pareamento para ${sessionId}`)
+			throw err
 		})
 	}
 
