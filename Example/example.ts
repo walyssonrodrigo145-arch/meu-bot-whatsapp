@@ -172,8 +172,11 @@ const startSock = async (sessionId: string, phoneNumber?: string): Promise<strin
 					const statusCode = (err as Boom)?.output?.statusCode
 					const errMsg = err?.message || ''
 
-					// Tratamento de sessão inválida / deslogada definitivamente
-					if (statusCode === DisconnectReason.loggedOut || errMsg.includes('401') || errMsg.includes('logged out')) {
+					const isLoggedOut = statusCode === DisconnectReason.loggedOut || errMsg.includes('401') || errMsg.includes('logged out')
+
+					// O WhatsApp Web encerra o socket de pareamento com erro 401/500 logo após o sucesso do código.
+					// Só limpamos o disco se for um deslogamento real de uma sessão que JÁ ESTAVA conectada (não em pareamento!)
+					if (isLoggedOut && current?.status !== 'PAIRING') {
 						logger.warn(`Sessão [${sessionId}] foi deslogada no celular ou chaves corrompidas (Erro 401). Limpando dados do disco...`)
 						try {
 							if (fs.existsSync(sessionDir)) {
@@ -184,8 +187,8 @@ const startSock = async (sessionId: string, phoneNumber?: string): Promise<strin
 						}
 						sessions.delete(sessionId)
 					} else {
-						// Erro de rede temporário, tenta restabelecer a conexão apenas se não estiver em encerramento
-						logger.info(`Sessão [${sessionId}] desconectada temporariamente. Tentando restabelecer conexão em 3s...`)
+						// Erro de rede temporário ou reinício pós-pareamento. Tenta restabelecer a conexão mantendo as chaves intactas
+						logger.info(`Sessão [${sessionId}] desconectada (status anterior: ${current?.status}). Tentando restabelecer conexão em 3s...`)
 						setTimeout(() => {
 							const checkSess = sessions.get(sessionId)
 							if (!checkSess?.isClosing) {
