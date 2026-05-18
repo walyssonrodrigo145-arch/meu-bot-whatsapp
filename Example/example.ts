@@ -173,7 +173,7 @@ const startSock = async (sessionId: string, phoneNumber?: string): Promise<strin
 					const errMsg = err?.message || ''
 
 					// Tratamento de sessão inválida / deslogada definitivamente
-					if (statusCode === DisconnectReason.loggedOut || errMsg.includes('401') || errMsg.includes('Connection failure') || errMsg.includes('logged out')) {
+					if (statusCode === DisconnectReason.loggedOut || errMsg.includes('401') || errMsg.includes('logged out')) {
 						logger.warn(`Sessão [${sessionId}] foi deslogada no celular ou chaves corrompidas (Erro 401). Limpando dados do disco...`)
 						try {
 							if (fs.existsSync(sessionDir)) {
