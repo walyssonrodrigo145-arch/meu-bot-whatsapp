@@ -321,9 +321,12 @@ app.post('/sessions/start', async (req: any, res: any) => {
 			})
 		}
 
-		// Trava de ouro: Se a sessão já está em pareamento (aguardando QR ou Código), não derruba o socket ativo!
-		// Retorna as informações atuais para o site aproveitar o QR ou o Código que já está na tela do celular
-		if (sess && sess.status === 'PAIRING' && sess.sock && !sess.isClosing) {
+		// Trava de ouro inteligente: Se a sessão já está em pareamento (aguardando QR ou Código), não derruba o socket ativo!
+		// EXCEÇÃO CRÍTICA: Se o usuário pediu Código de Pareamento (cleanNumber existe) mas a sessão ativa não tem pairingCode gerado
+		// (ex: foi iniciada pelo boot automático no modo QR), ignoramos a trava para forçar a geração do Código de Pareamento!
+		const isRequestingCodeButNoCodeExists = cleanNumber && !sess.pairingCode;
+
+		if (sess && sess.status === 'PAIRING' && sess.sock && !sess.isClosing && !isRequestingCodeButNoCodeExists) {
 			logger.info(`Sessão [${sessionId}] já está em processo de pareamento. Retornando dados ativos sem reiniciar socket...`)
 			return res.status(200).json({
 				success: true,
