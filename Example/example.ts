@@ -51,7 +51,7 @@ const getAuthPath = (sessionId: string) => {
 }
 
 // Start a connection for a specific sessionId
-const startSock = async (sessionId: string, phoneNumber?: string): Promise<string | undefined> => {
+const startSock = async (sessionId: string, phoneNumber?: string, isNewPairingRequest?: boolean): Promise<string | undefined> => {
 	// 1. Terminate any pre-existing session and clean up to prevent port or resource leaks
 	const existingSession = sessions.get(sessionId)
 	const previousPhone = phoneNumber || existingSession?.phoneNumber
@@ -80,11 +80,12 @@ const startSock = async (sessionId: string, phoneNumber?: string): Promise<strin
 
 	const sessionDir = getAuthPath(sessionId)
 
-	// Se for uma chamada explícita de pareamento com número fornecido, limpa as chaves antigas do disco
-	if (phoneNumber && fs.existsSync(sessionDir)) {
+	// SÓ LIMPA O DISCO SE FOR UMA NOVA REQUISIÇÃO EXPLÍCITA DA API (/sessions/start)!!!
+	// JAMAIS LIMPA O DISCO DURANTE AS RECONEXÕES INTERNAS DO SOCKET!!!
+	if (isNewPairingRequest && fs.existsSync(sessionDir)) {
 		try {
 			fs.rmSync(sessionDir, { recursive: true, force: true })
-			logger.info(`Limpeza de credenciais antigas no disco concluída para a nova sessão de pareamento: ${sessionId}`)
+			logger.info(`Limpeza de credenciais antigas no disco concluída para a nova requisição de pareamento: ${sessionId}`)
 		} catch (e) {
 			logger.error(e, `Erro ao limpar diretório físico para pareamento: ${sessionId}`)
 		}
@@ -340,7 +341,7 @@ app.post('/sessions/start', async (req: any, res: any) => {
 		}
 
 		logger.info(`Iniciando pareamento para a sessão [${sessionId}] (Modo: ${cleanNumber ? 'Código de Pareamento' : 'QR Code'})...`)
-		const code = await startSock(sessionId, cleanNumber)
+		const code = await startSock(sessionId, cleanNumber, true)
 
 		if (!cleanNumber) {
 			// Aguarda 1.5s para dar tempo de o primeiro QR Code ser emitido no connection.update
