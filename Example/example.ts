@@ -427,14 +427,25 @@ app.post('/sessions/status', async (req: any, res: any) => {
 	}
 })
 
-// 3. Disparar Lembrete por Sessão Específica (POST /send-message)
-app.post('/send-message', async (req: any, res: any) => {
+// 3. Disparar Lembrete (POST /send-message e POST / para compatibilidade com sistema legado)
+const handleSendMessage = async (req: any, res: any) => {
 	try {
 		if (!validateApiKey(req, res)) return
 
-		const { sessionId, number, message } = req.body
+		let { sessionId, number, message } = req.body
+		if (!sessionId) {
+			// Fallback inteligente para compatibilidade com o sistema legado: busca a primeira sessão ativa CONNECTED no mapa!
+			for (const [key, sessData] of sessions.entries()) {
+				if (sessData.status === 'CONNECTED' && sessData.sock) {
+					sessionId = key
+					logger.info(`[Fallback Legado] Utilizando sessão ativa CONNECTED: ${sessionId}`)
+					break
+				}
+			}
+		}
+
 		if (!sessionId || !number || !message) {
-			return res.status(400).json({ error: 'Parâmetros "sessionId", "number" e "message" são obrigatórios.' })
+			return res.status(400).json({ error: 'Parâmetros "number" e "message" são obrigatórios e nenhuma sessão ativa foi encontrada.' })
 		}
 
 		const sess = sessions.get(sessionId)
@@ -485,10 +496,13 @@ app.post('/send-message', async (req: any, res: any) => {
 
 		return res.status(200).json({ success: true, sessionId, messageId: sentMsg?.key?.id })
 	} catch (error: any) {
-		logger.error(error, `Erro ao disparar lembrete via API para a sessão: ${req.body?.sessionId}`)
+		logger.error(error, `Erro ao disparar lembrete via API para a sessão: ${req.body?.sessionId || 'desconhecida'}`)
 		return res.status(500).json({ error: 'Falha ao enviar mensagem', details: error.message })
 	}
-})
+}
+
+app.post('/send-message', handleSendMessage)
+app.post('/', handleSendMessage)
 
 // 4. Encerrar e Deletar Sessão (POST /sessions/logout)
 app.post('/sessions/logout', async (req: any, res: any) => {
