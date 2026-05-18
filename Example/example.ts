@@ -318,6 +318,21 @@ app.post('/sessions/start', async (req: any, res: any) => {
 			})
 		}
 
+		// Trava de ouro: Se a sessão já está em pareamento (aguardando QR ou Código), não derruba o socket ativo!
+		// Retorna as informações atuais para o site aproveitar o QR ou o Código que já está na tela do celular
+		if (sess && sess.status === 'PAIRING' && sess.sock && !sess.isClosing) {
+			logger.info(`Sessão [${sessionId}] já está em processo de pareamento. Retornando dados ativos sem reiniciar socket...`)
+			return res.status(200).json({
+				success: true,
+				sessionId,
+				status: 'PAIRING',
+				mode: sess.pairingCode ? 'PAIRING_CODE' : (sess.qr ? 'QR_CODE' : 'NONE'),
+				pairingCode: sess.pairingCode,
+				qr: sess.qr,
+				message: sess.pairingCode ? 'Código já gerado. Digite no celular.' : 'QR Code já ativo. Escaneie com o celular.'
+			})
+		}
+
 		logger.info(`Iniciando pareamento para a sessão [${sessionId}] (Modo: ${cleanNumber ? 'Código de Pareamento' : 'QR Code'})...`)
 		const code = await startSock(sessionId, cleanNumber)
 
