@@ -131,18 +131,53 @@ const startSock = async (sessionId: string, phoneNumber?: string, isNewPairingRe
 
 	let pairingCodePromise: Promise<string> | undefined
 	if (previousPhone && !sock.authState.creds.registered) {
-		logger.info(`Solicitando código de pareamento para o número ${previousPhone}...`)
-		pairingCodePromise = sock.requestPairingCode(previousPhone).then((code) => {
-			const current = sessions.get(sessionId)
-			if (current && !current.isClosing) {
-				current.pairingCode = code
-				current.status = 'PAIRING'
+		logger.info(`Aguardando abertura do túnel de conexão WebSocket para solicitar código de pareamento para ${previousPhone}...`)
+		pairingCodePromise = new Promise((resolve, reject) => {
+			let isResolved = false
+			// Escuta os eventos de conexão do Baileys para identificar quando o túnel WebSocket estiver aberto
+			const listener = (update: any) => {
+				// Quando o túnel abre (connecting ou open) ou se já passou tempo suficiente para o ws.isOpen estar true
+				if (!isResolved && (update.connection === 'connecting' || update.connection === 'open')) {
+					isResolved = true
+					sock.ev.off('connection.update', listener)
+					logger.info(`Túnel WebSocket aberto. Solicitando código de pareamento de 8 dígitos...`)
+					sock.requestPairingCode(previousPhone).then((code) => {
+						const current = sessions.get(sessionId)
+						if (current && !current.isClosing) {
+							current.pairingCode = code
+							current.status = 'PAIRING'
+						}
+						logger.info(`\n\n---> CÓDIGO DE PAREAMENTO WHATSAPP PARA [${sessionId}]: ${code} <---\n\n`)
+						resolve(code)
+					}).catch((err) => {
+						logger.error(err, `Erro ao solicitar código de pareamento para ${sessionId}`)
+						reject(err)
+					})
+				}
 			}
-			logger.info(`\n\n---> CÓDIGO DE PAREAMENTO WHATSAPP PARA [${sessionId}]: ${code} <---\n\n`)
-			return code
-		}).catch((err) => {
-			logger.error(err, `Erro ao solicitar código de pareamento para ${sessionId}`)
-			throw err
+			sock.ev.on('connection.update', listener)
+
+			// Fallback de segurança: se o evento de connecting demorar ou não for disparado, tenta após 1000ms
+			// (tempo mais que suficiente para o ws.isOpen estar true no Fly.io)
+			setTimeout(() => {
+				if (!isResolved) {
+					isResolved = true
+					sock.ev.off('connection.update', listener)
+					logger.info(`Fallback de tempo atingido. Solicitando código de pareamento de 8 dígitos...`)
+					sock.requestPairingCode(previousPhone).then((code) => {
+						const current = sessions.get(sessionId)
+						if (current && !current.isClosing) {
+							current.pairingCode = code
+							current.status = 'PAIRING'
+						}
+						logger.info(`\n\n---> CÓDIGO DE PAREAMENTO WHATSAPP PARA [${sessionId}]: ${code} <---\n\n`)
+						resolve(code)
+					}).catch((err) => {
+						logger.error(err, `Erro no fallback ao solicitar código de pareamento para ${sessionId}`)
+						reject(err)
+					})
+				}
+			}, 1000)
 		})
 	}
 
