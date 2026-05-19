@@ -108,6 +108,7 @@ const startSock = async (sessionId: string, phoneNumber?: string, isNewPairingRe
 
 	const sock = makeWASocket({
 		version,
+		browser: ['Chrome', 'Mac OS', ''], // Label canônico exigido pelo WhatsApp para o fluxo de pareamento
 		logger,
 		browser: ['Ubuntu', 'Chrome', '110.0.0'],
 		waWebSocketUrl: process.env.SOCKET_URL ?? DEFAULT_CONNECTION_CONFIG.waWebSocketUrl,
@@ -434,20 +435,10 @@ const handleSendMessage = async (req: any, res: any) => {
 	try {
 		if (!validateApiKey(req, res)) return
 
-		let { sessionId, number, message } = req.body
-		if (!sessionId) {
-			// Fallback inteligente para compatibilidade com o sistema legado: busca a primeira sessão ativa CONNECTED no mapa!
-			for (const [key, sessData] of sessions.entries()) {
-				if (sessData.status === 'CONNECTED' && sessData.sock) {
-					sessionId = key
-					logger.info(`[Fallback Legado] Utilizando sessão ativa CONNECTED: ${sessionId}`)
-					break
-				}
-			}
-		}
+		const { sessionId, number, message } = req.body
 
 		if (!sessionId || !number || !message) {
-			return res.status(400).json({ error: 'Parâmetros "number" e "message" são obrigatórios e nenhuma sessão ativa foi encontrada.' })
+			return res.status(400).json({ error: 'Os parâmetros "sessionId", "number" e "message" são estritamente obrigatórios.' })
 		}
 
 		const sess = sessions.get(sessionId)

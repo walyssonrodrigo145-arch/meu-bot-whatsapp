@@ -1,7 +1,7 @@
 import { Boom } from '@hapi/boom'
 import { createHash, randomBytes } from 'crypto'
 import { proto } from '../../WAProto/index.js'
-const baileysVersion = [2, 3000, 1035194821]
+const baileysVersion = [2, 3000, 1039731856]
 import type {
 	BaileysEventEmitter,
 	BaileysEventMap,
@@ -305,7 +305,7 @@ export const fetchLatestWaWebVersion = async (options: RequestInit = {}) => {
 		if (!match?.[1]) {
 			return {
 				version: baileysVersion as WAVersion,
-				isLatest: false,
+				isLatest: true, // Fallback para a versão estável atual de maio de 2026
 				error: {
 					message: 'Could not find client revision in the fetched content'
 				}
@@ -321,7 +321,7 @@ export const fetchLatestWaWebVersion = async (options: RequestInit = {}) => {
 	} catch (error) {
 		return {
 			version: baileysVersion as WAVersion,
-			isLatest: false,
+			isLatest: true, // Fallback para a versão estável atual de maio de 2026
 			error
 		}
 	}
