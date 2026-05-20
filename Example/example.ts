@@ -41,6 +41,7 @@ interface SessionData {
     pairingCode?: string;
     phoneNumber?: string;
     isClosing?: boolean;
+    paired?: boolean;
 }
 
 const sessions = new Map<string, SessionData>()
@@ -128,7 +129,8 @@ const startSock = async (sessionId: string, phoneNumber?: string, isNewPairingRe
 		phoneNumber: previousPhone,
 		pairingCode: previousPairingCode,
 		qr: previousQr,
-		isClosing: false
+		isClosing: false,
+		paired: false
 	})
 
 	let pairingCodePromise: Promise<string> | undefined
@@ -172,6 +174,11 @@ const startSock = async (sessionId: string, phoneNumber?: string, isNewPairingRe
 					return
 				}
 
+				if (update.isNewLogin && current) {
+					current.paired = true
+					logger.info(`Sessão [${sessionId}] pareada com sucesso! Aguardando reconexão de login...`)
+				}
+
 				if (qr && current) {
 					current.qr = qr
 					current.status = 'PAIRING'
@@ -199,8 +206,9 @@ const startSock = async (sessionId: string, phoneNumber?: string, isNewPairingRe
 
 					// O WhatsApp Web encerra o socket de pareamento com erro 401/500 logo após o sucesso do código.
 					// Só limpamos o disco se for um deslogamento real de uma sessão que JÁ ESTAVA conectada (não em pareamento!)
-					if (isLoggedOut && current?.status !== 'PAIRING') {
-						logger.warn(`Sessão [${sessionId}] foi deslogada no celular ou chaves corrompidas (Erro 401). Limpando dados do disco...`)
+					// ou se o pareamento falhou (erro 401 e não marcou 'paired' como true)
+					if (isLoggedOut && (current?.status !== 'PAIRING' || !current?.paired)) {
+						logger.warn(`Sessão [${sessionId}] foi deslogada ou pareamento falhou (Erro 401). Limpando dados do disco...`)
 						try {
 							if (fs.existsSync(sessionDir)) {
 								fs.rmSync(sessionDir, { recursive: true, force: true })
@@ -290,6 +298,7 @@ restoreSessions().then(() => {
 const app = express()
 app.use(cors())
 app.use(express.json())
+app.use(express.static('public')) // Serve a interface web premium estática na raiz
 
 const expectedApiKey = process.env.API_KEY ?? 'minha_chave_secreta_123'
 
@@ -313,12 +322,28 @@ app.post('/sessions/start', async (req: any, res: any) => {
 			return res.status(400).json({ error: 'Parâmetro "sessionId" é obrigatório.' })
 		}
 
-		// Formata o número se fornecido
+		// Formata o número se fornecido com as regras do 9º dígito no Brasil
 		let cleanNumber: string | undefined = undefined
 		if (phoneNumber) {
 			cleanNumber = phoneNumber.replace(/\D/g, '')
 			if (!cleanNumber.startsWith('55')) {
 				cleanNumber = '55' + cleanNumber
+			}
+			// Regras para números brasileiros (DDI 55)
+			if (cleanNumber.startsWith('55')) {
+				if (cleanNumber.length === 13) {
+					const ddd = parseInt(cleanNumber.slice(2, 4), 10)
+					// DDDs de 11 a 28 possuem o 9º dígito. Fora dessa faixa, o 9º dígito deve ser removido no JID
+					if (ddd < 11 || ddd > 28) {
+						cleanNumber = cleanNumber.slice(0, 4) + cleanNumber.slice(5)
+					}
+				} else if (cleanNumber.length === 12) {
+					const ddd = parseInt(cleanNumber.slice(2, 4), 10)
+					// DDDs de 11 a 28 devem possuir o 9º dígito. Adiciona se não estiver presente
+					if (ddd >= 11 && ddd <= 28) {
+						cleanNumber = cleanNumber.slice(0, 4) + '9' + cleanNumber.slice(4)
+					}
+				}
 			}
 		}
 
@@ -535,6 +560,49 @@ app.post('/sessions/logout', async (req: any, res: any) => {
 	} catch (error: any) {
 		logger.error(error, `Erro ao encerrar sessão: ${req.body?.sessionId}`)
 		return res.status(500).json({ error: 'Falha ao encerrar sessão', details: error.message })
+	}
+})
+
+// 5. Listar Todas as Sessões Ativas e Gravadas (POST /sessions/list)
+app.post('/sessions/list', async (req: any, res: any) => {
+	try {
+		if (!validateApiKey(req, res)) return
+
+		const list: any[] = []
+
+		// 1. Pega as sessões ativas na memória RAM
+		for (const [sessionId, sess] of sessions.entries()) {
+			list.push({
+				sessionId,
+				status: sess.status,
+				phone: sess.phoneNumber,
+				pairingCode: sess.pairingCode,
+				qr: sess.qr,
+				mode: sess.pairingCode ? 'PAIRING_CODE' : (sess.qr ? 'QR_CODE' : 'NONE'),
+			})
+		}
+
+		// 2. Verifica também as pastas no disco (baileys_auth_info) para incluir sessões descarregadas ou em boot
+		if (fs.existsSync('baileys_auth_info')) {
+			const dirs = fs.readdirSync('baileys_auth_info')
+			for (const dir of dirs) {
+				if (!sessions.has(dir)) {
+					const fullPath = path.join('baileys_auth_info', dir)
+					if (fs.statSync(fullPath).isDirectory()) {
+						list.push({
+							sessionId: dir,
+							status: 'DISCONNECTED',
+							message: 'Sessão gravada no disco (inativa na memória).'
+						})
+					}
+				}
+			}
+		}
+
+		return res.status(200).json({ success: true, sessions: list })
+	} catch (error: any) {
+		logger.error(error, 'Erro ao listar sessões no /sessions/list')
+		return res.status(500).json({ error: 'Falha ao listar sessões', details: error.message })
 	}
 })
 
