@@ -60,8 +60,8 @@ const startSock = async (sessionId: string, phoneNumber?: string, isNewPairingRe
 	const previousQr = existingSession?.qr
 
 	if (existingSession) {
-		if (existingSession.status === 'CONNECTED' && !phoneNumber) {
-			logger.info(`Sessão [${sessionId}] já conectada na inicialização rápida.`)
+		if (existingSession.status === 'CONNECTED') {
+			logger.info(`Sessão [${sessionId}] já conectada. Evitando reinicialização redundante.`)
 			return
 		}
 		
@@ -222,8 +222,8 @@ const startSock = async (sessionId: string, phoneNumber?: string, isNewPairingRe
 						logger.info(`Sessão [${sessionId}] desconectada (status anterior: ${current?.status}). Tentando restabelecer conexão em 3s...`)
 						setTimeout(() => {
 							const checkSess = sessions.get(sessionId)
-							if (!checkSess?.isClosing) {
-								startSock(sessionId, checkSess?.phoneNumber).catch(() => {})
+							if (checkSess && !checkSess.isClosing && checkSess.status !== 'CONNECTED') {
+								startSock(sessionId, checkSess.phoneNumber).catch(() => {})
 							}
 						}, 3000)
 					}
