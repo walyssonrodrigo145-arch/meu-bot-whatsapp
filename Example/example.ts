@@ -464,12 +464,13 @@ const handleSendMessage = async (req: any, res: any) => {
 		let jid = `${cleanNumber}@s.whatsapp.net`
 
 		// Valida se o número é oficial no WhatsApp
-		let [waExists] = await sock.onWhatsApp(jid)
+		// onWhatsApp pode retornar undefined se o servidor não trouxer resultados; usamos ?? [] para evitar TypeError no destructuring
+		let [waExists] = (await sock.onWhatsApp(jid)) ?? []
 
 		if (!waExists?.exists && cleanNumber.startsWith('55') && cleanNumber.length === 13) {
 			// Tenta remover o dígito 9 após o DDD se for 13 dígitos
 			const semNove = cleanNumber.slice(0, 4) + cleanNumber.slice(5)
-			const [waExistsSemNove] = await sock.onWhatsApp(`${semNove}@s.whatsapp.net`)
+			const [waExistsSemNove] = (await sock.onWhatsApp(`${semNove}@s.whatsapp.net`)) ?? []
 			if (waExistsSemNove?.exists) {
 				jid = waExistsSemNove.jid
 				waExists = waExistsSemNove
@@ -477,7 +478,7 @@ const handleSendMessage = async (req: any, res: any) => {
 		} else if (!waExists?.exists && cleanNumber.startsWith('55') && cleanNumber.length === 12) {
 			// Tenta adicionar o dígito 9 após o DDD se for 12 dígitos
 			const comNove = cleanNumber.slice(0, 4) + '9' + cleanNumber.slice(4)
-			const [waExistsComNove] = await sock.onWhatsApp(`${comNove}@s.whatsapp.net`)
+			const [waExistsComNove] = (await sock.onWhatsApp(`${comNove}@s.whatsapp.net`)) ?? []
 			if (waExistsComNove?.exists) {
 				jid = waExistsComNove.jid
 				waExists = waExistsComNove
