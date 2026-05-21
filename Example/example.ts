@@ -109,7 +109,7 @@ const startSock = async (sessionId: string, phoneNumber?: string, isNewPairingRe
 
 	const sock = makeWASocket({
 		version,
-		browser: ['Chrome', 'Mac OS', ''], // Label canônico exigido pelo WhatsApp para o fluxo de pareamento
+		browser: ['Ubuntu', 'Chrome', '22.04.4'], // Formato exigido pelo WhatsApp: [OS, Browser, Version]
 		logger,
 		browser: ['Ubuntu', 'Chrome', '110.0.0'],
 		waWebSocketUrl: process.env.SOCKET_URL ?? DEFAULT_CONNECTION_CONFIG.waWebSocketUrl,
