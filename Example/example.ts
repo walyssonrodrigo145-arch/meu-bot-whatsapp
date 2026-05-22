@@ -325,7 +325,7 @@ app.post('/sessions/start', async (req: any, res: any) => {
 		// Formata o número se fornecido com as regras do 9º dígito no Brasil
 		let cleanNumber: string | undefined = undefined
 		if (phoneNumber) {
-			cleanNumber = phoneNumber.replace(/\D/g, '')
+			cleanNumber = String(phoneNumber).replace(/\D/g, '')
 			if (!cleanNumber.startsWith('55')) {
 				cleanNumber = '55' + cleanNumber
 			}
@@ -512,7 +512,7 @@ const handleSendMessage = async (req: any, res: any) => {
 		const sock = sess.sock
 
 		// Limpa caracteres do número
-		let cleanNumber = number.replace(/\D/g, '')
+		let cleanNumber = String(number).replace(/\D/g, '')
 		if (!cleanNumber.startsWith('55')) {
 			cleanNumber = '55' + cleanNumber
 		}
