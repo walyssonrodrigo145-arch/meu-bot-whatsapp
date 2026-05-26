@@ -419,6 +419,12 @@ app.post('/sessions/start', async (req: any, res: any) => {
 	}
 })
 
+// Helper de Timeout para Promessas
+const promiseWithTimeout = <T>(promise: Promise<T>, ms: number, errorMsg = 'Timeout'): Promise<T> => {
+	const timeout = new Promise<never>((_, reject) => setTimeout(() => reject(new Error(errorMsg)), ms))
+	return Promise.race([promise, timeout])
+}
+
 // 2. Consultar Status da Conexão (POST /sessions/status)
 app.post('/sessions/status', async (req: any, res: any) => {
 	try {
@@ -438,16 +444,55 @@ app.post('/sessions/status', async (req: any, res: any) => {
 			})
 		}
 
+		let realStatus = sess.status
+
+		// Se a sessão consta como CONNECTED, fazemos uma validação ativa e em tempo real
+		if (realStatus === 'CONNECTED') {
+			if (!sess.sock) {
+				realStatus = 'DISCONNECTED'
+			} else {
+				const socketWs = sess.sock.ws
+				// 1. Verifica se o WebSocket está inicializado e aberto (readyState 1)
+				if (!socketWs || socketWs.readyState !== 1) {
+					logger.warn(`Sessão [${sessionId}] com socket desconectado ou em estado inválido (readyState: ${socketWs?.readyState})`)
+					realStatus = 'DISCONNECTED'
+				} else {
+					// 2. Tenta uma consulta leve na rede do WhatsApp para garantir chaves e tokens ativos
+					const ownJid = sess.sock.user?.id
+					if (ownJid) {
+						try {
+							// Consulta se o próprio número existe no WhatsApp (verificação rápida que bate no servidor do WhatsApp)
+							const [result] = await promiseWithTimeout(sess.sock.onWhatsApp(ownJid), 3000, 'WhatsApp connection timeout')
+							if (!result || !result.exists) {
+								logger.warn(`Sessão [${sessionId}] falhou ao validar número próprio na rede do WhatsApp.`)
+								realStatus = 'DISCONNECTED'
+							}
+						} catch (err: any) {
+							logger.warn(`Erro de validação ativa para a sessão [${sessionId}]: ${err.message}. Marcando como inativa/zumbi.`)
+							realStatus = 'DISCONNECTED'
+						}
+					} else {
+						realStatus = 'DISCONNECTED'
+					}
+				}
+			}
+
+			// Se a validação falhou, atualiza o status interno para evitar retentativas infrutíferas
+			if (realStatus === 'DISCONNECTED') {
+				sess.status = 'DISCONNECTED'
+			}
+		}
+
 		return res.status(200).json({
 			sessionId,
-			status: sess.status,
+			status: realStatus,
 			phone: sess.phoneNumber,
 			pairingCode: sess.pairingCode,
 			qr: sess.qr,
 			mode: sess.pairingCode ? 'PAIRING_CODE' : (sess.qr ? 'QR_CODE' : 'NONE'),
-			message: sess.status === 'CONNECTED'
+			message: realStatus === 'CONNECTED'
 				? 'WhatsApp conectado e pronto para disparos.'
-				: (sess.status === 'PAIRING' ? (sess.pairingCode ? 'Aguardando digitação do código no celular.' : 'Aguardando escaneamento do QR Code.') : 'Sessão desconectada.')
+				: (realStatus === 'PAIRING' ? (sess.pairingCode ? 'Aguardando digitação do código no celular.' : 'Aguardando escaneamento do QR Code.') : 'Sessão desconectada ou zumbi (necessário reconectar).')
 		})
 	} catch (error: any) {
 		logger.error(error, `Erro ao consultar status da sessão: ${req.body?.sessionId}`)
