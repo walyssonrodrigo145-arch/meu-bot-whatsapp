@@ -451,29 +451,22 @@ app.post('/sessions/status', async (req: any, res: any) => {
 			if (!sess.sock) {
 				realStatus = 'DISCONNECTED'
 			} else {
-				const socketWs = sess.sock.ws
-				// 1. Verifica se o WebSocket está inicializado e aberto (readyState 1)
-				if (!socketWs || socketWs.readyState !== 1) {
-					logger.warn(`Sessão [${sessionId}] com socket desconectado ou em estado inválido (readyState: ${socketWs?.readyState})`)
-					realStatus = 'DISCONNECTED'
-				} else {
-					// 2. Tenta uma consulta leve na rede do WhatsApp para garantir chaves e tokens ativos
-					const ownJid = sess.sock.user?.id
-					if (ownJid) {
-						try {
-							// Consulta se o próprio número existe no WhatsApp (verificação rápida que bate no servidor do WhatsApp)
-							const [result] = await promiseWithTimeout(sess.sock.onWhatsApp(ownJid), 3000, 'WhatsApp connection timeout')
-							if (!result || !result.exists) {
-								logger.warn(`Sessão [${sessionId}] falhou ao validar número próprio na rede do WhatsApp.`)
-								realStatus = 'DISCONNECTED'
-							}
-						} catch (err: any) {
-							logger.warn(`Erro de validação ativa para a sessão [${sessionId}]: ${err.message}. Marcando como inativa/zumbi.`)
+				// Tenta uma consulta leve na rede do WhatsApp para garantir chaves e tokens ativos
+				const ownJid = sess.sock.user?.id
+				if (ownJid) {
+					try {
+						// Consulta se o próprio número existe no WhatsApp (verificação rápida que bate no servidor do WhatsApp)
+						const [result] = await promiseWithTimeout(sess.sock.onWhatsApp(ownJid), 3000, 'WhatsApp connection timeout')
+						if (!result || !result.exists) {
+							logger.warn(`Sessão [${sessionId}] falhou ao validar número próprio na rede do WhatsApp.`)
 							realStatus = 'DISCONNECTED'
 						}
-					} else {
+					} catch (err: any) {
+						logger.warn(`Erro de validação ativa para a sessão [${sessionId}]: ${err.message}. Marcando como inativa/zumbi.`)
 						realStatus = 'DISCONNECTED'
 					}
+				} else {
+					realStatus = 'DISCONNECTED'
 				}
 			}
 
