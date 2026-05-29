@@ -42,6 +42,8 @@ interface SessionData {
     phoneNumber?: string;
     isClosing?: boolean;
     paired?: boolean;
+    _reconnectAttempt?: number;
+    _reconnectTimer?: NodeJS.Timeout;
 }
 
 const sessions = new Map<string, SessionData>()
@@ -206,11 +208,14 @@ const startSock = async (sessionId: string, phoneNumber?: string, isNewPairingRe
 
 					const isLoggedOut = statusCode === DisconnectReason.loggedOut || errMsg.includes('401') || errMsg.includes('logged out')
 
-					// O WhatsApp Web encerra o socket de pareamento com erro 401/500 logo após o sucesso do código.
-					// Só limpamos o disco se for um deslogamento real de uma sessão que JÁ ESTAVA conectada (não em pareamento!)
-					// ou se o pareamento falhou (erro 401 e não marcou 'paired' como true)
-					if (isLoggedOut && (current?.status !== 'PAIRING' || !current?.paired)) {
-						logger.warn(`Sessão [${sessionId}] foi deslogada ou pareamento falhou (Erro 401). Limpando dados do disco...`)
+					// stream:error 515 = reinício exigido pelo servidor após pareamento bem-sucedido.
+					// É NORMAL e NÃO é um logout. Devemos reconectar imediatamente sem limpar credenciais.
+					const isRestartRequired = statusCode === 515 || errMsg.includes('restart required') || errMsg.includes('515')
+
+					// O WhatsApp Web encerra o socket de pareamento com erro 515 logo após o sucesso do código.
+					// Só limpamos o disco se for um deslogamento real E a sessão não estava em processo de pareamento com 'paired' = true.
+					if (isLoggedOut && !isRestartRequired && (current?.status !== 'PAIRING' || !current?.paired)) {
+						logger.warn(`Sessão [${sessionId}] foi deslogada (statusCode: ${statusCode}). Limpando dados do disco...`)
 						try {
 							if (fs.existsSync(sessionDir)) {
 								fs.rmSync(sessionDir, { recursive: true, force: true })
@@ -219,28 +224,34 @@ const startSock = async (sessionId: string, phoneNumber?: string, isNewPairingRe
 							logger.error(e, `Erro ao limpar arquivos da pasta ${sessionDir}`)
 						}
 						sessions.delete(sessionId)
-					} else {
-						// Erro de rede temporário, reinício pós-pareamento ou stream:error 515 (restart required).
-						// CORREÇÃO CRÍTICA: marca o status como DISCONNECTED ANTES de agendar o reconect,
-						// pois se a sessão estava CONNECTED e caiu, a verificação checkSess.status !== 'CONNECTED'
-						// bloqueava o reconect. Agora o status é atualizado imediatamente.
+					} else if (!isLoggedOut || isRestartRequired) {
+						// Erro de rede temporário, reinício pós-pareamento (515) ou connectionLost.
+						// Atualiza o status para DISCONNECTED antes de agendar reconexão.
 						if (current) {
 							current.status = 'DISCONNECTED'
+							// Cancela timer anterior para evitar loops duplos de reconexão
+							if (current._reconnectTimer) {
+								clearTimeout(current._reconnectTimer)
+								current._reconnectTimer = undefined
+							}
 						}
-						const reconnectAttempt = (current as any)?._reconnectAttempt ?? 0
-						// Backoff exponencial: 3s, 6s, 12s, máximo de 30s
-						const delayMs = Math.min(3000 * Math.pow(2, reconnectAttempt), 30_000)
-						logger.info(`Sessão [${sessionId}] desconectada (código: ${statusCode}, msg: ${errMsg || 'sem mensagem'}). Tentando reconectar em ${delayMs / 1000}s... (tentativa ${reconnectAttempt + 1})`)
-						setTimeout(() => {
+						const reconnectAttempt = current?._reconnectAttempt ?? 0
+						// Reconexão imediata após stream:error 515 (esperado pós-pareamento), backoff exponencial nos demais casos
+						const delayMs = isRestartRequired ? 1500 : Math.min(3000 * Math.pow(2, reconnectAttempt), 30_000)
+						logger.info(`Sessão [${sessionId}] desconectada (código: ${statusCode}, restart: ${isRestartRequired}). Reconectando em ${delayMs / 1000}s... (tentativa ${reconnectAttempt + 1})`)
+						const timer = setTimeout(() => {
 							const checkSess = sessions.get(sessionId)
-							// Reconecta se a sessão existe, não está sendo fechada intencionalmente e não está já conectada
 							if (checkSess && !checkSess.isClosing && checkSess.status !== 'CONNECTED') {
-								;(checkSess as any)._reconnectAttempt = reconnectAttempt + 1
+								checkSess._reconnectAttempt = isRestartRequired ? 0 : reconnectAttempt + 1
+								checkSess._reconnectTimer = undefined
 								startSock(sessionId, checkSess.phoneNumber).catch((e) => {
 									logger.error(e, `Erro ao reconectar sessão ${sessionId}`)
 								})
 							}
 						}, delayMs)
+						if (current) {
+							current._reconnectTimer = timer
+						}
 					}
 				}
 
@@ -377,7 +388,7 @@ app.post('/sessions/start', async (req: any, res: any) => {
 		// Trava de ouro inteligente: Se a sessão já está em pareamento (aguardando QR ou Código), não derruba o socket ativo!
 		// EXCEÇÃO CRÍTICA: Se o usuário pediu Código de Pareamento (cleanNumber existe) mas a sessão ativa não tem pairingCode gerado
 		// (ex: foi iniciada pelo boot automático no modo QR), ignoramos a trava para forçar a geração do Código de Pareamento!
-		const isRequestingCodeButNoCodeExists = cleanNumber && !sess.pairingCode;
+		const isRequestingCodeButNoCodeExists = cleanNumber && !sess?.pairingCode;
 
 		if (sess && sess.status === 'PAIRING' && sess.sock && !sess.isClosing && !isRequestingCodeButNoCodeExists) {
 			logger.info(`Sessão [${sessionId}] já está em processo de pareamento. Retornando dados ativos sem reiniciar socket...`)
@@ -461,32 +472,16 @@ app.post('/sessions/status', async (req: any, res: any) => {
 
 		let realStatus = sess.status
 
-		// Se a sessão consta como CONNECTED, fazemos uma validação ativa e em tempo real
+		// Verificação leve e não-invasiva: apenas checa se o socket existe e o WebSocket está aberto.
+		// Evitamos chamar onWhatsApp() aqui pois é uma consulta de rede cara que pode:
+		// 1. Bloquear por até 3s em cada chamada de /status
+		// 2. Falhar por timeout transitório e marcar uma sessão VIVA como DISCONNECTED
+		// 3. Gerar tráfego excessivo no servidor do WhatsApp e acionar rate-limit
 		if (realStatus === 'CONNECTED') {
-			if (!sess.sock) {
+			const wsOpen = sess.sock?.ws?.isOpen ?? false
+			if (!sess.sock || !wsOpen) {
+				logger.warn({ sessionId }, 'Sessão marcada CONNECTED mas WebSocket não está aberto. Marcando como DISCONNECTED.')
 				realStatus = 'DISCONNECTED'
-			} else {
-				// Tenta uma consulta leve na rede do WhatsApp para garantir chaves e tokens ativos
-				const ownJid = sess.sock.user?.id
-				if (ownJid) {
-					try {
-						// Consulta se o próprio número existe no WhatsApp (verificação rápida que bate no servidor do WhatsApp)
-						const [result] = await promiseWithTimeout(sess.sock.onWhatsApp(ownJid), 3000, 'WhatsApp connection timeout')
-						if (!result || !result.exists) {
-							logger.warn(`Sessão [${sessionId}] falhou ao validar número próprio na rede do WhatsApp.`)
-							realStatus = 'DISCONNECTED'
-						}
-					} catch (err: any) {
-						logger.warn(`Erro de validação ativa para a sessão [${sessionId}]: ${err.message}. Marcando como inativa/zumbi.`)
-						realStatus = 'DISCONNECTED'
-					}
-				} else {
-					realStatus = 'DISCONNECTED'
-				}
-			}
-
-			// Se a validação falhou, atualiza o status interno para evitar retentativas infrutíferas
-			if (realStatus === 'DISCONNECTED') {
 				sess.status = 'DISCONNECTED'
 			}
 		}
