@@ -109,9 +109,8 @@ const startSock = async (sessionId: string, phoneNumber?: string, isNewPairingRe
 
 	const sock = makeWASocket({
 		version,
-		browser: ['Ubuntu', 'Chrome', '22.04.4'], // Formato exigido pelo WhatsApp: [OS, Browser, Version]
-		logger,
 		browser: ['Ubuntu', 'Chrome', '110.0.0'],
+		logger,
 		waWebSocketUrl: process.env.SOCKET_URL ?? DEFAULT_CONNECTION_CONFIG.waWebSocketUrl,
 		auth: {
 			creds: state.creds,
@@ -123,6 +122,7 @@ const startSock = async (sessionId: string, phoneNumber?: string, isNewPairingRe
 	})
 
 	// Inicializa o mapa com a nova sessão preservando os dados anteriores
+	// _reconnectAttempt é zerado quando o socket abre com sucesso (ver connection === 'open')
 	sessions.set(sessionId, {
 		sock,
 		status: 'PAIRING',
@@ -186,11 +186,13 @@ const startSock = async (sessionId: string, phoneNumber?: string, isNewPairingRe
 				}
 
 				if (connection === 'open') {
-					logger.info(`Sessão do professor [${sessionId}] CONECTADA com sucesso!`)
+					logger.info(`Sessão [${sessionId}] CONECTADA com sucesso!`)
 					if (current) {
 						current.status = 'CONNECTED'
 						current.pairingCode = undefined
 						current.qr = undefined
+						// Zera o contador de tentativas ao conectar com sucesso
+						;(current as any)._reconnectAttempt = 0
 						if (sock.user?.id) {
 							current.phoneNumber = sock.user.id.split(':')[0]
 						}
@@ -218,14 +220,27 @@ const startSock = async (sessionId: string, phoneNumber?: string, isNewPairingRe
 						}
 						sessions.delete(sessionId)
 					} else {
-						// Erro de rede temporário ou reinício pós-pareamento. Tenta restabelecer a conexão mantendo as chaves intactas
-						logger.info(`Sessão [${sessionId}] desconectada (status anterior: ${current?.status}). Tentando restabelecer conexão em 3s...`)
+						// Erro de rede temporário, reinício pós-pareamento ou stream:error 515 (restart required).
+						// CORREÇÃO CRÍTICA: marca o status como DISCONNECTED ANTES de agendar o reconect,
+						// pois se a sessão estava CONNECTED e caiu, a verificação checkSess.status !== 'CONNECTED'
+						// bloqueava o reconect. Agora o status é atualizado imediatamente.
+						if (current) {
+							current.status = 'DISCONNECTED'
+						}
+						const reconnectAttempt = (current as any)?._reconnectAttempt ?? 0
+						// Backoff exponencial: 3s, 6s, 12s, máximo de 30s
+						const delayMs = Math.min(3000 * Math.pow(2, reconnectAttempt), 30_000)
+						logger.info(`Sessão [${sessionId}] desconectada (código: ${statusCode}, msg: ${errMsg || 'sem mensagem'}). Tentando reconectar em ${delayMs / 1000}s... (tentativa ${reconnectAttempt + 1})`)
 						setTimeout(() => {
 							const checkSess = sessions.get(sessionId)
+							// Reconecta se a sessão existe, não está sendo fechada intencionalmente e não está já conectada
 							if (checkSess && !checkSess.isClosing && checkSess.status !== 'CONNECTED') {
-								startSock(sessionId, checkSess.phoneNumber).catch(() => {})
+								;(checkSess as any)._reconnectAttempt = reconnectAttempt + 1
+								startSock(sessionId, checkSess.phoneNumber).catch((e) => {
+									logger.error(e, `Erro ao reconectar sessão ${sessionId}`)
+								})
 							}
-						}, 3000)
+						}, delayMs)
 					}
 				}
 
