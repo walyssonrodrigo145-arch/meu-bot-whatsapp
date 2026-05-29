@@ -111,7 +111,6 @@ const startSock = async (sessionId: string, phoneNumber?: string, isNewPairingRe
 
 	const sock = makeWASocket({
 		version,
-		browser: ['Ubuntu', 'Chrome', '110.0.0'],
 		logger,
 		waWebSocketUrl: process.env.SOCKET_URL ?? DEFAULT_CONNECTION_CONFIG.waWebSocketUrl,
 		auth: {
