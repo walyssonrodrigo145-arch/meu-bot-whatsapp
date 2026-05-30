@@ -53,6 +53,36 @@ const getAuthPath = (sessionId: string) => {
 	return path.join('baileys_auth_info', sessionId)
 }
 
+// --- NOTIFICAÇÃO DE DESCONEXÃO PARA O SITE wr-music-app ---
+// Enviado sempre que uma sessão é realmente deslogada (statusCode 401 ou logout)
+// Configurável por variáveis de ambiente.
+const SITE_WEBHOOK_URL = process.env.BOT_DISCONNECT_WEBHOOK_URL || 'https://wr-music-app.onrender.com/api/webhooks/bot-status'
+const SITE_WEBHOOK_SECRET = process.env.BOT_WEBHOOK_SECRET || 'bot_webhook_secret_wr_music'
+
+async function notifyDisconnect(sessionId: string, reason: string): Promise<void> {
+	try {
+		const payload = JSON.stringify({
+			sessionId,
+			status: 'DISCONNECTED',
+			reason,
+			timestamp: new Date().toISOString(),
+			secret: SITE_WEBHOOK_SECRET,
+		})
+		const controller = new AbortController()
+		const timer = setTimeout(() => controller.abort(), 10_000)
+		await fetch(SITE_WEBHOOK_URL, {
+			method: 'POST',
+			headers: { 'Content-Type': 'application/json' },
+			body: payload,
+			signal: controller.signal,
+		})
+		clearTimeout(timer)
+		logger.info({ sessionId, reason }, '[WEBHOOK] Notificação de desconexão enviada ao site com sucesso.')
+	} catch (e) {
+		logger.warn({ err: e, sessionId }, '[WEBHOOK] Falha ao notificar desconexão ao site (não crítico).')
+	}
+}
+
 // Start a connection for a specific sessionId
 const startSock = async (sessionId: string, phoneNumber?: string, isNewPairingRequest?: boolean): Promise<string | undefined> => {
 	// 1. Terminate any pre-existing session and clean up to prevent port or resource leaks
@@ -228,6 +258,8 @@ const startSock = async (sessionId: string, phoneNumber?: string, isNewPairingRe
 							logger.error(e, `Erro ao limpar arquivos da pasta ${sessionDir}`)
 						}
 						sessions.delete(sessionId)
+						// Notifica o site wr-music-app sobre a desconexão real
+						notifyDisconnect(sessionId, `Logout detectado (statusCode: ${statusCode})`).catch(() => {})
 					} else if (!isLoggedOut || isRestartRequired) {
 						// Erro de rede temporário, reinício pós-pareamento (515) ou connectionLost.
 						// Atualiza o status para DISCONNECTED antes de agendar reconexão.
