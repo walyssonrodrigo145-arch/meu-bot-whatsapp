@@ -106,7 +106,10 @@ const startSock = async (sessionId: string, phoneNumber?: string, isNewPairingRe
 		state.creds.advSecretKey = process.env.ADV_SECRET_KEY
 	}
 
-	const { version, isLatest } = await fetchLatestWaWebVersion()
+	// fetchLatestBaileysVersion usa versão estável hardcoded na lib.
+	// fetchLatestWaWebVersion busca a versão LIVE do WhatsApp CDN e pode mudar a cada restart,
+	// causando rejeição 401 porque a assinatura de versão ficou diferente da sessão original.
+	const { version, isLatest } = await fetchLatestBaileysVersion()
 	logger.info({ version: version.join('.'), isLatest }, `Iniciando socket Baileys para sessionId: [${sessionId}]`)
 
 	const sock = makeWASocket({
@@ -119,6 +122,8 @@ const startSock = async (sessionId: string, phoneNumber?: string, isNewPairingRe
 		},
 		msgRetryCounterCache,
 		generateHighQualityLinkPreview: true,
+		// Enviar ping a cada 30s para manter a sessão ativa e evitar timeout do WhatsApp
+		keepAliveIntervalMs: 30_000,
 		getMessage
 	})
 
